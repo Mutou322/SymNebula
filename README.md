@@ -1,12 +1,12 @@
-# NebulaMind — 仿脑编程器
-# NebulaMind — Brain-like Mathematical Model Forge
+# SymNebula — 符号星云
+# SymNebula — Symbol Nebula: Brain-like Mathematical Model Forge
 
 > 一张活的、可自动重算的数学草稿纸。
 > A living, auto-recomputing mathematical scratch paper.
 
-**NebulaMind**（仿脑编程器）是一个纯粹、确定性的数学公式推演与模型动态运行工具。
+**SymNebula**（符号星云）是一个纯粹、确定性的数学公式推演与模型动态运行工具。
 
-**NebulaMind** is a purely deterministic mathematical formula deduction and dynamic model simulation tool.
+**SymNebula** is a purely deterministic mathematical formula deduction and dynamic model simulation tool.
 
 它以人类大脑的神经元-突触网络为架构参考，以纯数学逻辑为唯一灵魂。用户通过创建"空神经元"、向其中输入自定义数学公式、并用"突触链接"将它们编织成星云图，即可让抽象的数学模型在计算机上演化、运行、被观察。
 

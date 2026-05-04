@@ -8,9 +8,9 @@
 ///   5. 执行 scheduler.step()
 ///   6. 验证 Node1.b 自动变为 5
 
-use nebula_core::ast::{parse_simple_eq, Expr};
-use nebula_core::graph::NebulaGraph;
-use nebula_core::engine::Scheduler;
+use sym_nebula_core::ast::{parse_simple_eq, Expr};
+use sym_nebula_core::graph::NebulaGraph;
+use sym_nebula_core::engine::Scheduler;
 
 fn main() {
     println!("{}", "=".repeat(60));

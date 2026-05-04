@@ -1,5 +1,5 @@
 [package]
-name = "nebula-core"
+name = "sym-nebula-core"
 version = "0.1.0"
 edition = "2021"
 description = "NebulaMind — Pure mathematical formula deduction engine (no external deps)"

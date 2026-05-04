@@ -3,5 +3,5 @@
 version = 4
 
 [[package]]
-name = "nebula-core"
+name = "sym-nebula-core"
 version = "0.1.0"
