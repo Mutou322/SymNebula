@@ -1,7 +1,7 @@
 /// SymNebula 压力测试集
 ///
 /// 测试 A：双向坍缩 — 链接到 b 而非 a，验证 a 自动解出 5
-/// 测试 B：反馈环路 — next_a = a + 1，自环，验证 Tick 迭代
+/// 测试 B：反馈环路 — next_a = a + 1，自环，验证 Tick 迭代递增
 /// 测试 C：紫色奇异 — a / b = 10, b = 0，验证紫色安全切断
 ///
 /// 运行: cargo run --bin stress
@@ -30,11 +30,10 @@ fn main() {
     let n1_a = graph_a.add_node(eq_a);
     let n2_a = graph_a.add_node(Expr::Number(5.0));
 
-    // 链接 5 -> b（不是 a）
-    graph_a.add_edge(n2_a, "output", n1_a, "b");
+    // 链接 5 -> b（不是 a），带默认值
+    graph_a.add_edge_with_default(n2_a, "output", n1_a, "b", 5.0);
 
     let mut sched_a = Scheduler::new(graph_a);
-    sched_a.env.insert((n2_a, "output".to_string()), 5.0);
     sched_a.step();
 
     let a_val = sched_a.get_value(n1_a, "a");
@@ -66,48 +65,58 @@ fn main() {
     println!("  测试 B：反馈环路 (Feedback Loop Test)");
     println!("{}", "=".repeat(60));
     println!("  公式: next_a = a + 1");
-    println!("  链接: next_a -> a (自环)");
-    println!("  初值: a = 0");
-    println!("  预期: Tick1 → a = 1, Tick2 → a = 2");
+    println!("  链接: next_a -> a (自环，双缓冲模式)");
+    println!("  初值: a = 0 (通过边默认值)");
+    println!("  预期: Tick1 → output=1, Tick2 → output=2, Tick3 → output=3");
     println!();
 
     let eq_b = parse_simple_eq("next_a = a + 1").expect("解析失败");
     let mut graph_b = NebulaGraph::new();
     let node_b = graph_b.add_node(eq_b);
 
-    // 自环: next_a -> a
-    graph_b.add_edge(node_b, "next_a", node_b, "a");
+    // 自环: next_a -> a，默认值 0
+    graph_b.add_edge_with_default(node_b, "next_a", node_b, "a", 0.0);
 
     let mut sched_b = Scheduler::new(graph_b);
 
-    // 设置初值 a = 0
-    sched_b.env.insert((node_b, "a".to_string()), 0.0);
-
-    println!("  Tick 0: a = 0 (初值)");
+    println!("  双缓冲模式：Compute 从 delay_buffer 读 a，Commit 写 next_a");
+    println!();
 
     // Tick 1
-    println!("  [调试] env 前: {:?}", sched_b.env);
     sched_b.step();
-    println!("  [调试] env 后: {:?}", sched_b.env);
-    let a_t1 = sched_b.get_value(node_b, "a");
-    println!("  Tick 1: a = {:?}", a_t1);
+    let t1 = sched_b.get_value(node_b, "output");
+    println!("  Tick 1: output = {:?} (期望 1)", t1);
 
     // Tick 2
     sched_b.step();
-    let a_t2 = sched_b.get_value(node_b, "a");
-    println!("  Tick 2: a = {:?}", a_t2);
+    let t2 = sched_b.get_value(node_b, "output");
+    println!("  Tick 2: output = {:?} (期望 2)", t2);
 
-    let b_ok = match (a_t1, a_t2) {
-        (Some(t1), Some(t2)) if (t1 - 1.0).abs() < 1e-9 && (t2 - 2.0).abs() < 1e-9 => {
-            println!("  ✅ 测试 B 通过: Tick1 = {}, Tick2 = {}", t1, t2);
+    // Tick 3
+    sched_b.step();
+    let t3 = sched_b.get_value(node_b, "output");
+    println!("  Tick 3: output = {:?} (期望 3)", t3);
+
+    println!();
+
+    let b_ok = match (t1, t2, t3) {
+        (Some(v1), Some(v2), Some(v3))
+            if (v1 - 1.0).abs() < 1e-9
+                && (v2 - 2.0).abs() < 1e-9
+                && (v3 - 3.0).abs() < 1e-9 =>
+        {
+            println!("  ✅ 测试 B 通过: Tick1={}, Tick2={}, Tick3={}", v1, v2, v3);
             true
         }
-        (Some(t1), Some(t2)) => {
-            println!("  ❌ 测试 B 失败: Tick1 = {}, Tick2 = {} (期望 1, 2)", t1, t2);
+        (Some(v1), Some(v2), Some(v3)) => {
+            println!(
+                "  ❌ 测试 B 失败: Tick1={}, Tick2={}, Tick3={} (期望 1, 2, 3)",
+                v1, v2, v3
+            );
             false
         }
         _ => {
-            println!("  ❌ 测试 B 失败: 未推导出 a");
+            println!("  ❌ 测试 B 失败: 未推导出 output");
             false
         }
     };
@@ -129,10 +138,11 @@ fn main() {
     let mut graph_c = NebulaGraph::new();
     let node_c = graph_c.add_node(eq_c);
 
-    let mut sched_c = Scheduler::new(graph_c);
+    // 创建一个常量节点 0 并链接到 node_c.b
+    let zero_node_c = graph_c.add_node(Expr::Number(0.0));
+    graph_c.add_edge_with_default(zero_node_c, "output", node_c, "b", 0.0);
 
-    // 输入 b = 0（触发除零）
-    sched_c.env.insert((node_c, "b".to_string()), 0.0);
+    let mut sched_c = Scheduler::new(graph_c);
 
     // 不应该崩溃
     sched_c.step();

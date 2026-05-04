@@ -28,12 +28,19 @@ pub struct Node {
 // ============================================================
 
 /// 有向边：源节点 -> 目标节点，并指定连接的符号名称
+///
+/// 携带双缓冲所需的 delay_buffer（锁存值供下一 Tick 读取）
+/// 和 default_value（T0 初始值）。
 #[derive(Debug, Clone)]
 pub struct Synapse {
     pub from_node: usize,
     pub from_symbol: String,
     pub to_node: usize,
     pub to_symbol: String,
+    /// 锁存值——Compute 阶段从此读取，Commit 阶段写入下一 Tick 值
+    pub delay_buffer: Option<f64>,
+    /// 初始静息电位（T0 时 delay_buffer 为空则用此值）
+    pub default_value: Option<f64>,
 }
 
 // ============================================================
@@ -75,19 +82,72 @@ impl NebulaGraph {
             from_symbol: from_symbol.to_string(),
             to_node,
             to_symbol: to_symbol.to_string(),
+            delay_buffer: None,
+            default_value: None,
         });
     }
 
-    /// 收集目标节点的已知输入（来自上游节点的输出）
-    pub fn collect_inputs(&self, node_id: usize, global_env: &HashMap<(usize, String), f64>) -> HashMap<String, f64> {
+    /// 添加有向边并设置默认值
+    pub fn add_edge_with_default(
+        &mut self,
+        from_node: usize,
+        from_symbol: &str,
+        to_node: usize,
+        to_symbol: &str,
+        default_value: f64,
+    ) {
+        self.edges.push(Synapse {
+            from_node,
+            from_symbol: from_symbol.to_string(),
+            to_node,
+            to_symbol: to_symbol.to_string(),
+            delay_buffer: None,
+            default_value: Some(default_value),
+        });
+    }
+
+    /// 获取目标节点在 Compute 阶段的已知输入
+    ///
+    /// 从所有入边的 delay_buffer 读取。
+    /// 若 delay_buffer 为 None，则用 default_value 兜底。
+    /// 若两者都为 None，该输入不参与计算。
+    pub fn get_inputs_for_node(&self, node_id: usize) -> HashMap<String, f64> {
         let mut known = HashMap::new();
         for e in &self.edges {
             if e.to_node == node_id {
-                if let Some(val) = global_env.get(&(e.from_node, e.from_symbol.clone())) {
-                    known.insert(e.to_symbol.clone(), *val);
+                let val = e.delay_buffer.or(e.default_value);
+                if let Some(v) = val {
+                    known.insert(e.to_symbol.clone(), v);
                 }
             }
         }
         known
+    }
+
+    /// 将 src 中该节点相关条目的值写入对应出边的 delay_buffer（Commit 阶段）
+    ///
+    /// src 格式为 (node_id, symbol) -> value，遍历所有边，
+    /// 若边的 from_node 匹配且 from_symbol 匹配，则写入 delay_buffer。
+    pub fn commit_outputs(&mut self, src: &HashMap<(usize, String), f64>) {
+        for edge in &mut self.edges {
+            let key = (edge.from_node, edge.from_symbol.clone());
+            if let Some(val) = src.get(&key) {
+                edge.delay_buffer = Some(*val);
+            }
+        }
+    }
+
+    /// 设置某条边的默认值（用于测试或脚本初始化）
+    pub fn set_edge_default_value(&mut self, from_node: usize, from_symbol: &str, to_node: usize, to_symbol: &str, default: f64) {
+        for edge in &mut self.edges {
+            if edge.from_node == from_node
+                && edge.from_symbol == from_symbol
+                && edge.to_node == to_node
+                && edge.to_symbol == to_symbol
+            {
+                edge.default_value = Some(default);
+                break;
+            }
+        }
     }
 }

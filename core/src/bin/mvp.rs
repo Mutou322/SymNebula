@@ -4,7 +4,7 @@
 ///   1. 定义公式 "a + b = 10"
 ///   2. 解析，识别 a、b 为接线柱
 ///   3. 创建 Node1（约束节点）和 Node2（常量 5）
-///   4. 建立链接 Node2.output → Node1.a
+///   4. 建立链接 Node2.output → Node1.a（带默认值）
 ///   5. 执行 scheduler.step()
 ///   6. 验证 Node1.b 自动变为 5
 
@@ -44,9 +44,9 @@ fn main() {
     println!("       节点2 (常量5): id={}", node2);
     println!();
 
-    // Step 3: 建立链接
-    println!("[3/5] 建立链接: Node2.output -> Node1.a ...");
-    graph.add_edge(node2, "output", node1, "a");
+    // Step 3: 建立链接（带默认值）
+    println!("[3/5] 建立链接: Node2.output -> Node1.a (默认值=5) ...");
+    graph.add_edge_with_default(node2, "output", node1, "a", 5.0);
     println!("       OK");
     println!();
 
@@ -54,10 +54,7 @@ fn main() {
     println!("[4/5] 初始化调度器 ...");
     let mut scheduler = Scheduler::new(graph);
 
-    // 初始化 Node2 的输出值为 5
-    scheduler.env.insert((node2, "output".to_string()), 5.0);
-
-    // 检查传播
+    // 检查传播前的输入
     let a_val = scheduler.get_value(node1, "a");
     println!("       Node1.a = {:?}", a_val);
     println!();
