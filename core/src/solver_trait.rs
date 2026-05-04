@@ -97,6 +97,67 @@ pub fn first_unknown(expr: &Expr, ctx: &NodeContext) -> Option<String> {
 }
 
 // ============================================================
+// LocalContext：节点局部上下文快照
+// ============================================================
+
+/// Newton 迭代内部的局部上下文。
+///
+/// 从 NodeContext 快照节点输入端口的符号值，迭代中的 ctx.set
+/// 只作用在此副本上，不影响全局上下文和其他节点。
+#[derive(Debug, Clone)]
+pub struct LocalContext {
+    values: HashMap<String, f64>,
+}
+
+impl LocalContext {
+    /// 从全局上下文快照该节点的输入符号
+    pub fn from_node(node: &Node, global: &NodeContext) -> Self {
+        let mut values = HashMap::new();
+        // 将全局上下文中该节点公式涉及的所有符号快照过来
+        let syms = node.formula.symbols();
+        for s in &syms {
+            if global.is_defined(s) {
+                values.insert(s.clone(), global.get(s));
+            }
+        }
+        // 也纳入节点自身的当前值
+        if let Some(v) = node.value {
+            if let Some(target) = &node.solve_target {
+                values.entry(target.clone()).or_insert(v);
+            }
+        }
+        LocalContext { values }
+    }
+
+    /// 从已知值的 HashMap 构建（兼容 engine 的 known）
+    pub fn from_map(values: HashMap<String, f64>) -> Self {
+        LocalContext { values }
+    }
+
+    pub fn get(&self, name: &str) -> f64 {
+        *self.values.get(name).unwrap_or(&0.0)
+    }
+
+    pub fn set(&mut self, name: &str, val: f64) {
+        self.values.insert(name.to_string(), val);
+    }
+
+    pub fn is_defined(&self, name: &str) -> bool {
+        self.values.contains_key(name)
+    }
+
+    /// 转为 HashMap 供外部使用
+    pub fn into_map(self) -> HashMap<String, f64> {
+        self.values
+    }
+
+    /// 获取底层值的引用（兼容 make_eq_function 接口）
+    pub fn as_known(&self) -> &HashMap<String, f64> {
+        &self.values
+    }
+}
+
+// ============================================================
 // StdNewtonSolver
 // ============================================================
 
@@ -129,22 +190,23 @@ impl Solver for StdNewtonSolver {
                         true
                     }
                     _ => {
-                        // 降级到 Newton
+                        // 降级到 Newton，使用局部快照避免污染全局
                         let target = solve_target.as_deref().unwrap_or("");
                         if target.is_empty() {
                             return false;
                         }
+                        let mut local = LocalContext::from_node(node, ctx);
 
-                        // 检查 f(x) 是否可求值
-                        let mut f = crate::solver::make_eq_function(formula, target, known);
-                        let test_val = f(node.solver_state.current);
+                        // 检查 f(x) 是否可求值（在局部上下文中）
+                        let mut test_f = crate::solver::make_eq_function(formula, target, local.as_known());
+                        let test_val = test_f(node.solver_state.current);
                         if !test_val.is_finite() {
-                            return false; // 奇异，调用方处理
+                            return false;
                         }
 
                         crate::solver::solver_step(
                             &mut node.solver_state,
-                            crate::solver::make_eq_function(formula, target, known),
+                            crate::solver::make_eq_function(formula, target, local.as_known()),
                         );
 
                         if node.solver_state.converged {
