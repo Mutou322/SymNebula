@@ -316,6 +316,154 @@ pub fn solve_or_iterate(
 }
 
 // ============================================================
+// 微型矩阵库（仅用于多变量 Newton，无外部依赖）
+// ============================================================
+
+/// 微型方阵，按行存储
+#[derive(Debug, Clone)]
+pub struct Matrix {
+    rows: usize,
+    cols: usize,
+    data: Vec<f64>,
+}
+
+impl Matrix {
+    pub fn new(rows: usize, cols: usize) -> Self {
+        Matrix {
+            rows,
+            cols,
+            data: vec![0.0; rows * cols],
+        }
+    }
+
+    pub fn get(&self, i: usize, j: usize) -> f64 {
+        self.data[i * self.cols + j]
+    }
+
+    pub fn set(&mut self, i: usize, j: usize, val: f64) {
+        self.data[i * self.cols + j] = val;
+    }
+
+    /// 原地高斯消元求解 Ax = b，返回 x
+    pub fn solve(mut self, mut b: Vec<f64>) -> Result<Vec<f64>, String> {
+        let n = self.rows;
+        if self.cols != n || b.len() != n {
+            return Err("维度不匹配".into());
+        }
+
+        for col in 0..n {
+            // 部分选主元
+            let mut max_row = col;
+            for row in col + 1..n {
+                if self.get(row, col).abs() > self.get(max_row, col).abs() {
+                    max_row = row;
+                }
+            }
+            if self.get(max_row, col).abs() < 1e-12 {
+                return Err("矩阵奇异或接近奇异".into());
+            }
+
+            if max_row != col {
+                for j in 0..n {
+                    let tmp = self.get(col, j);
+                    self.set(col, j, self.get(max_row, j));
+                    self.set(max_row, j, tmp);
+                }
+                b.swap(col, max_row);
+            }
+
+            for row in col + 1..n {
+                let factor = self.get(row, col) / self.get(col, col);
+                for j in col..n {
+                    let new_val = self.get(row, j) - factor * self.get(col, j);
+                    self.set(row, j, new_val);
+                }
+                b[row] -= factor * b[col];
+            }
+        }
+
+        let mut x = vec![0.0; n];
+        for i in (0..n).rev() {
+            let mut sum = b[i];
+            for j in i + 1..n {
+                sum -= self.get(i, j) * x[j];
+            }
+            x[i] = sum / self.get(i, i);
+        }
+
+        Ok(x)
+    }
+}
+
+// ============================================================
+// 多变量 Newton（Jacobian + 高斯消元）
+// ============================================================
+
+/// 多变量 Newton 单步迭代。
+///
+/// state: 当前变量值，会被更新
+/// f: F(X) -> Vec<f64>，方程组残差
+/// tol: 收敛阈值
+///
+/// 返回 Ok(true) 已收敛, Ok(false) 还需继续, Err 奇异
+pub fn solver_step_multi<F>(
+    state: &mut Vec<f64>,
+    mut f: F,
+    tol: f64,
+) -> Result<bool, String>
+where
+    F: FnMut(&Vec<f64>) -> Vec<f64>,
+{
+    let x = state.clone();
+    let fx = f(&x);
+    let n = x.len();
+
+    if fx.iter().all(|&v| v.abs() < tol) {
+        return Ok(true);
+    }
+
+    let eps = 1e-6;
+    let mut jac = Matrix::new(n, n);
+
+    for i in 0..n {
+        let mut x_eps = x.clone();
+        x_eps[i] += eps;
+        let fx_eps = f(&x_eps);
+
+        for j in 0..n {
+            jac.set(j, i, (fx_eps[j] - fx[j]) / eps);
+        }
+    }
+
+    let rhs: Vec<f64> = fx.iter().map(|v| -v).collect();
+
+    match jac.solve(rhs) {
+        Ok(dx) => {
+            for i in 0..n {
+                state[i] += dx[i];
+            }
+            Ok(false)
+        }
+        Err(msg) => Err(format!("Newton step failed: {}", msg)),
+    }
+}
+
+// ============================================================
+// 半隐式欧拉（Symplectic Euler）
+// ============================================================
+
+/// 半隐式欧拉积分一步。
+///
+/// v_{n+1} = v_n + a_n * dt
+/// x_{n+1} = x_n + v_{n+1} * dt
+///
+/// 相比显式欧拉，能量守恒性从 O(dt) 提升到 O(dt^2)。
+pub fn symplectic_euler_step(x: &mut f64, v: &mut f64, a: f64, dt: f64) {
+    *v += a * dt;
+    *x += *v * dt;
+}
+
+// ============================================================
 // 测试
 // ============================================================
 
@@ -424,12 +572,9 @@ mod tests {
         let known = HashMap::new();
         let mut solver = SolverState::new(3.0);
 
-        // 迭代多次让 Newton 收敛
         let (val, _, _) = solve_or_iterate(&expr, &known, &mut solver, "x");
-        // 第一次调用：Newton 一步，接近但不到 2
         assert!((val - 2.0).abs() < 0.2, "Newton 一步应接近 2, 得到 {}", val);
 
-        // 再跑几步直到收敛
         for _ in 0..10 {
             if solver.converged {
                 break;
@@ -437,7 +582,146 @@ mod tests {
             solve_or_iterate(&expr, &known, &mut solver, "x");
         }
         assert!(solver.converged, "Newton 应最终收敛");
-        assert!((solver.current - 2.0).abs() < 1e-5,
-            "期望收敛到 2, 得到 {}", solver.current);
+        assert!(
+            (solver.current - 2.0).abs() < 1e-5,
+            "期望收敛到 2, 得到 {}",
+            solver.current
+        );
+    }
+
+    // --- 微型矩阵测试 ---
+
+    #[test]
+    fn test_matrix_solve_2x2() {
+        // 2x + 3y = 7
+        // 4x - y  = 1
+        // 解: x=1, y=1.666...
+        let mut a = Matrix::new(2, 2);
+        a.set(0, 0, 2.0); a.set(0, 1, 3.0);
+        a.set(1, 0, 4.0); a.set(1, 1, -1.0);
+        let b = vec![7.0, 1.0];
+
+        let x = a.solve(b).unwrap();
+        assert!((x[0] - 5.0 / 7.0).abs() < 1e-9, "期望 x=5/7≈0.714, 得到 {}", x[0]);
+        assert!((x[1] - 13.0 / 7.0).abs() < 1e-9, "期望 y=13/7≈1.857, 得到 {}", x[1]);
+    }
+
+    #[test]
+    fn test_matrix_solve_3x3() {
+        // x + y + z = 6
+        // 2x - y + z = 3
+        // x + 2y - z = 2
+        // 解: x=1, y=2, z=3
+        let mut a = Matrix::new(3, 3);
+        a.set(0, 0, 1.0); a.set(0, 1, 1.0); a.set(0, 2, 1.0);
+        a.set(1, 0, 2.0); a.set(1, 1, -1.0); a.set(1, 2, 1.0);
+        a.set(2, 0, 1.0); a.set(2, 1, 2.0); a.set(2, 2, -1.0);
+        let b = vec![6.0, 3.0, 2.0];
+
+        let x = a.solve(b).unwrap();
+        assert!((x[0] - 1.0).abs() < 1e-9);
+        assert!((x[1] - 2.0).abs() < 1e-9);
+        assert!((x[2] - 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_singular_matrix() {
+        // 奇异矩阵：行列式为0
+        // [1 2; 2 4]
+        let mut a = Matrix::new(2, 2);
+        a.set(0, 0, 1.0); a.set(0, 1, 2.0);
+        a.set(1, 0, 2.0); a.set(1, 1, 4.0);
+        let b = vec![3.0, 6.0];
+
+        let result = a.solve(b);
+        assert!(result.is_err(), "奇异矩阵应返回 Err");
+    }
+
+    // --- 多变量 Newton 测试 ---
+
+    #[test]
+    fn test_newton_multi_2eq() {
+        // 方程组:
+        // x^2 + y^2 = 25
+        // x * y = 12
+        // 解: x=3, y=4 (或 x=4, y=3)
+        let mut state = vec![5.0, 1.0]; // 初值
+
+        let f = |vars: &Vec<f64>| -> Vec<f64> {
+            let x = vars[0];
+            let y = vars[1];
+            vec![
+                x * x + y * y - 25.0,  // x^2 + y^2 = 25
+                x * y - 12.0,          // x * y = 12
+            ]
+        };
+
+        for _ in 0..20 {
+            if let Ok(true) = solver_step_multi(&mut state, &f, 1e-9) {
+                break;
+            }
+        }
+
+        assert!((state[0] - 3.0).abs() < 1e-5 || (state[0] - 4.0).abs() < 1e-5,
+            "x 应收敛到 3 或 4, 得到 {}", state[0]);
+        assert!((state[1] - 4.0).abs() < 1e-5 || (state[1] - 3.0).abs() < 1e-5,
+            "y 应收敛到 4 或 3, 得到 {}", state[1]);
+    }
+
+    // --- 半隐式欧拉测试 ---
+
+    #[test]
+    fn test_symplectic_euler() {
+        let mut x = 0.0;
+        let mut v = 1.0;
+        let a = 0.0; // 匀速运动
+        let dt = 0.01;
+
+        symplectic_euler_step(&mut x, &mut v, a, dt);
+        assert!((v - 1.0).abs() < 1e-9, "速度应不变");
+        assert!((x - 0.01).abs() < 1e-9, "x = v * dt = 0.01");
+    }
+
+    #[test]
+    fn test_symplectic_vs_explicit_energy() {
+        // 简谐振动: a = -k*x (k=1)
+        // 比较显式欧拉和半隐式欧拉的能量漂移
+        let dt = 0.1;
+        let steps = 200;
+
+        // 显式欧拉: x_{n+1} = x_n + v_n * dt; v_{n+1} = v_n + a_n * dt
+        let mut xe = 1.0;
+        let mut ve = 0.0;
+        let mut energy_e = Vec::new();
+
+        for _ in 0..steps {
+            let a = -xe;
+            let v_new = ve + a * dt;
+            let x_new = xe + ve * dt; // 显式：用旧速度
+            xe = x_new;
+            ve = v_new;
+            energy_e.push(0.5 * (ve * ve + xe * xe));
+        }
+
+        // 半隐式欧拉: v_{n+1} = v_n + a_n * dt; x_{n+1} = x_n + v_{n+1} * dt
+        let mut xs = 1.0;
+        let mut vs = 0.0;
+        let mut energy_s = Vec::new();
+
+        for _ in 0..steps {
+            let a = -xs;
+            symplectic_euler_step(&mut xs, &mut vs, a, dt);
+            energy_s.push(0.5 * (vs * vs + xs * xs));
+        }
+
+        // 半隐式欧拉的末态能量漂移应小于显式欧拉
+        let drift_e = (energy_e[steps - 1] - energy_e[0]).abs();
+        let drift_s = (energy_s[steps - 1] - energy_s[0]).abs();
+        assert!(
+            drift_s < drift_e,
+            "半隐式欧拉能量漂移 ({}) 应小于显式欧拉 ({})",
+            drift_s,
+            drift_e
+        );
     }
 }
