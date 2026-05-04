@@ -15,11 +15,10 @@
 
 use std::collections::HashMap;
 use std::fmt;
-
 use crate::ast::{parse_expression, parse_simple_eq, Expr};
-use crate::graph::{NebulaGraph, Node};
+use crate::cluster::{ClusterCache, ClusterSolverV3, VarPort};
+use crate::graph::NebulaGraph;
 use crate::state::NodeState;
-use crate::cluster::{ClusterCache, ClusterCompilation, ClusterSolverV3, TickCompilation};
 
 // ============================================================
 // 数据结构：.brainstorm 各层
@@ -692,6 +691,58 @@ impl BrainstormFile {
             snapshots: Vec::new(), version: VersionTxt::parse(&vt)?,
         })
     }
+}
+
+// ============================================================
+// Tick Restore — 从 .brainstorm 状态恢复 solver
+// ============================================================
+
+/// 从 Brainstorm 快照恢复 ClusterSolverV3 状态
+///
+/// 步骤:
+///   1. 重建 NebulaGraph
+///   2. 编译 cluster（或使用缓存）
+///   3. 将 state.variables 和 x_cluster_cache 注入 cluster_xs
+///   4. 返回 solver 和 graph
+pub fn restore_tick(bsi: &Brainstorm) -> Result<(ClusterSolverV3, NebulaGraph), String> {
+    let graph = bsi.to_graph()?;
+    let mut solver = ClusterSolverV3::new();
+    let mut cache = ClusterCache::new();
+    solver.compile(&graph, &mut cache);
+
+    // 从 state.variables 和 x_cluster_cache 恢复值
+    // 遍历所有 cluster，尝试从 node_state 和 variables 获取值
+    if let Some(ref comp) = solver.compilation {
+        for (ci, cluster_comp) in comp.clusters.iter().enumerate() {
+            // 从 x_cluster_cache 恢复（如果存在）
+            let cache_key = format!("cluster_{}", ci);
+            if let Some(cached_vals) = bsi.state.x_cluster_cache.get(&cache_key) {
+                if cached_vals.len() == solver.cluster_xs[ci].len() {
+                    solver.cluster_xs[ci].copy_from_slice(cached_vals);
+                    continue;
+                }
+            }
+            // 从 state.variables 逐个恢复
+            for node_id in &cluster_comp.node_ids {
+                for sym in graph.nodes.iter()
+                    .filter(|n| n.id == *node_id)
+                    .flat_map(|n| n.formula.symbols())
+                {
+                    let var_key = format!("n{}_{}", node_id, sym);
+                    if let Some(&val) = bsi.state.variables.get(&var_key) {
+                        let port = VarPort::new(*node_id, &sym);
+                        if let Some(&gidx) = cluster_comp.global_idx_map.get(&port) {
+                            if gidx < solver.cluster_xs[ci].len() {
+                                solver.cluster_xs[ci][gidx] = val;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok((solver, graph))
 }
 
 #[cfg(test)]
