@@ -801,8 +801,7 @@ impl ClusterSolverV3 {
                 }
             }
 
-            eprintln!("DBG ci={} sing={} unconv={} blocks={} temp_x={:?}", ci, cluster_has_singular, cluster_has_unconverged, cluster_comp.blocks.len(), temp_x);
-            // ---- 原子提交决策 ----
+            // 决定集群颜色
             let node_color = if cluster_has_singular {
                 NodeState::Purple
             } else if cluster_has_unconverged {
@@ -816,21 +815,17 @@ impl ClusterSolverV3 {
             // 仅成功时写回 cluster_xs，失败/未收敛保留旧值（Yellow 状态保持）
             if node_color == NodeState::Green {
                 self.cluster_xs[ci].copy_from_slice(&temp_x);
-                if ci == 0 {
-                    
-                }
-            } else {
-                if ci == 0 {
-                    
-                }
             }
-
             // Purple/Yellow：不写回，cluster_xs[ci] 保留上一 Tick 的值
-            // Yellow 的 temp_x 可作为下一 Tick 初值（已保留在 temp_x，但 cluster_xs 仍是旧值）
-            // 这一步实现"逐步逼近"链式推进
 
+            // 为该集群创建状态列表
+            let mut cluster_states: Vec<(usize, NodeState)> = Vec::new();
             for &nid in &cluster_comp.node_ids {
-                all_states.push(vec![(nid, node_color.clone())]);
+                cluster_states.push((nid, node_color.clone()));
+            }
+            all_states.push(cluster_states);
+            for &nid in &cluster_comp.node_ids {
+                all_states.last_mut().unwrap().push((nid, node_color.clone()));
             }
         }
 
@@ -1184,5 +1179,53 @@ mod tests {
         // tick 不应 panic
         let result = solver.tick();
         assert!(result.avg_residual.is_finite());
+    }
+
+    /// 事务性求解：奇异集群全紫，正常集群不受影响
+    ///
+    /// Cluster A (3节点, 有 synapse 连通):
+    ///   n0: x + y = 7
+    ///   n1: x - y = 1
+    ///   n2: x * 0 = 1    ← 奇异方程（0=1 矛盾）
+    ///
+    /// Cluster B (1节点, 孤立):
+    ///   n3: z + 2 = 5
+    ///
+    /// 期望结果：Cluster A 全部 Purple, Cluster B 为 Green
+    #[test]
+    fn test_singular_cluster_does_not_affect_normal() {
+        let mut g = NebulaGraph::new();
+        let n0 = g.add_node(parse_simple_eq("x + y = 7").unwrap());
+        let n1 = g.add_node(parse_simple_eq("x - y = 1").unwrap());
+        let n2 = g.add_node(parse_simple_eq("x * 0 = 1").unwrap());   // 奇异
+        let n3 = g.add_node(parse_simple_eq("z + 2 = 5").unwrap());   // 正常
+
+        // Cluster A: n0 <-> n1 <-> n2 (synapse 连通)
+        g.add_edge_with_default(n0, "x", n1, "x", 0.0);
+        g.add_edge_with_default(n0, "y", n1, "y", 0.0);
+        g.add_edge_with_default(n1, "x", n2, "x", 0.0);
+
+        let mut solver = ClusterSolverV3::new();
+        let mut cache = ClusterCache::new();
+        solver.compile(&g, &mut cache);
+
+        // 多次 tick 让奇异稳定显现
+        for _ in 0..5 {
+            let result = solver.tick();
+            println!("tick residual={:.2e}", result.avg_residual);
+
+            // Cluster A (ci=0): 3 个节点, 应该 Purple
+            for &(nid, ref state) in &result.cluster_states[0] {
+                println!("  cluster A node {}: {:?}", nid, state);
+                assert_eq!(*state, NodeState::Purple,
+                    "Cluster A 节点 {} 应为 Purple (奇异方程污染), 实际 {:?}", nid, state);
+            }
+            // Cluster B (ci=1): 1 个节点, 应该 Green
+            for &(nid, ref state) in &result.cluster_states[1] {
+                println!("  cluster B node {}: {:?}", nid, state);
+                assert_eq!(*state, NodeState::Green,
+                    "Cluster B 节点 {} 应为 Green (不受影响), 实际 {:?}", nid, state);
+            }
+        }
     }
 }
