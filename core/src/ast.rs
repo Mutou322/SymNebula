@@ -72,7 +72,11 @@ impl Expr {
             Expr::Pow(a, b) => {
                 let base = a.eval(env)?;
                 let exp = b.eval(env)?;
-                Ok(base.powf(exp))
+                if base == 0.0 && exp < 0.0 {
+                    Err("除零错误: 0 的负数次方".into())
+                } else {
+                    Ok(base.powf(exp))
+                }
             }
             Expr::Eq(_, _) => Err("Eq 不能直接求值".into()),
         }

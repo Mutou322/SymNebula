@@ -42,7 +42,14 @@ impl Scheduler {
             };
 
             // 收集该节点的已知输入
-            let known = self.graph.collect_inputs(node_id, &self.env);
+            let mut known = self.graph.collect_inputs(node_id, &self.env);
+
+            // Step 3: 也把 env 中该节点自身的值注入 known
+            for ((nid, sym), val) in &self.env {
+                if *nid == node_id {
+                    known.entry(sym.clone()).or_insert(*val);
+                }
+            }
 
             // 根据公式类型处理
             let formula = self.graph.nodes[node_idx].formula.clone();

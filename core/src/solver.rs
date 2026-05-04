@@ -123,20 +123,19 @@ fn solve_for_symbol(
             }
         }
         Expr::Mul(a, b) => {
+            // a * b = target
             if contains_symbol(a, symbol) {
                 let bv = b.eval(known)?;
                 if bv == 0.0 {
-                    Err("除零错误".into())
-                } else {
-                    solve_for_symbol(a, symbol, target_value / bv, known)
+                    return Err("乘零错误: 右侧表达式含除零".into());
                 }
+                solve_for_symbol(a, symbol, target_value / bv, known)
             } else if contains_symbol(b, symbol) {
                 let av = a.eval(known)?;
                 if av == 0.0 {
-                    Err("除零错误".into())
-                } else {
-                    solve_for_symbol(b, symbol, target_value / av, known)
+                    return Err("乘零错误: 左侧表达式含除零".into());
                 }
+                solve_for_symbol(b, symbol, target_value / av, known)
             } else {
                 Err("乘法中未找到目标符号".into())
             }
