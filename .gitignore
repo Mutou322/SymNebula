@@ -1,0 +1,10 @@
+/target/
+**/__pycache__/
+*.pyc
+*.pyo
+.venv/
+*.brainstorm
+*.zip
+*.swp
+.DS_Store
+Thumbs.db
