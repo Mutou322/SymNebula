@@ -21,13 +21,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "sym-nebula-core"
-version = "0.1.0"
-dependencies = [
- "symnebula-macros",
-]
-
-[[package]]
 name = "symnebula-macros"
 version = "0.1.0"
 dependencies = [

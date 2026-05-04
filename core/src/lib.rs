@@ -16,3 +16,6 @@ pub mod graph;
 pub mod solver;
 pub mod engine;
 pub mod solver_trait;
+pub mod integrators;
+pub mod guard;
+pub mod solvers;

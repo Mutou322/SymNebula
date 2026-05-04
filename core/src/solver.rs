@@ -400,12 +400,6 @@ impl Matrix {
 // ============================================================
 
 /// 多变量 Newton 单步迭代。
-///
-/// state: 当前变量值，会被更新
-/// f: F(X) -> Vec<f64>，方程组残差
-/// tol: 收敛阈值
-///
-/// 返回 Ok(true) 已收敛, Ok(false) 还需继续, Err 奇异
 pub fn solver_step_multi<F>(
     state: &mut Vec<f64>,
     mut f: F,
@@ -446,21 +440,6 @@ where
         }
         Err(msg) => Err(format!("Newton step failed: {}", msg)),
     }
-}
-
-// ============================================================
-// 半隐式欧拉（Symplectic Euler）
-// ============================================================
-
-/// 半隐式欧拉积分一步。
-///
-/// v_{n+1} = v_n + a_n * dt
-/// x_{n+1} = x_n + v_{n+1} * dt
-///
-/// 相比显式欧拉，能量守恒性从 O(dt) 提升到 O(dt^2)。
-pub fn symplectic_euler_step(x: &mut f64, v: &mut f64, a: f64, dt: f64) {
-    *v += a * dt;
-    *x += *v * dt;
 }
 
 // ============================================================
@@ -706,62 +685,5 @@ mod tests {
             "x 应收敛到 3 或 4, 得到 {}", state[0]);
         assert!((state[1] - 4.0).abs() < 1e-5 || (state[1] - 3.0).abs() < 1e-5,
             "y 应收敛到 4 或 3, 得到 {}", state[1]);
-    }
-
-    // --- 半隐式欧拉测试 ---
-
-    #[test]
-    fn test_symplectic_euler() {
-        let mut x = 0.0;
-        let mut v = 1.0;
-        let a = 0.0; // 匀速运动
-        let dt = 0.01;
-
-        symplectic_euler_step(&mut x, &mut v, a, dt);
-        assert!((v - 1.0).abs() < 1e-9, "速度应不变");
-        assert!((x - 0.01).abs() < 1e-9, "x = v * dt = 0.01");
-    }
-
-    #[test]
-    fn test_symplectic_vs_explicit_energy() {
-        // 简谐振动: a = -k*x (k=1)
-        // 比较显式欧拉和半隐式欧拉的能量漂移
-        let dt = 0.1;
-        let steps = 200;
-
-        // 显式欧拉: x_{n+1} = x_n + v_n * dt; v_{n+1} = v_n + a_n * dt
-        let mut xe = 1.0;
-        let mut ve = 0.0;
-        let mut energy_e = Vec::new();
-
-        for _ in 0..steps {
-            let a = -xe;
-            let v_new = ve + a * dt;
-            let x_new = xe + ve * dt; // 显式：用旧速度
-            xe = x_new;
-            ve = v_new;
-            energy_e.push(0.5 * (ve * ve + xe * xe));
-        }
-
-        // 半隐式欧拉: v_{n+1} = v_n + a_n * dt; x_{n+1} = x_n + v_{n+1} * dt
-        let mut xs = 1.0;
-        let mut vs = 0.0;
-        let mut energy_s = Vec::new();
-
-        for _ in 0..steps {
-            let a = -xs;
-            symplectic_euler_step(&mut xs, &mut vs, a, dt);
-            energy_s.push(0.5 * (vs * vs + xs * xs));
-        }
-
-        // 半隐式欧拉的末态能量漂移应小于显式欧拉
-        let drift_e = (energy_e[steps - 1] - energy_e[0]).abs();
-        let drift_s = (energy_s[steps - 1] - energy_s[0]).abs();
-        assert!(
-            drift_s < drift_e,
-            "半隐式欧拉能量漂移 ({}) 应小于显式欧拉 ({})",
-            drift_s,
-            drift_e
-        );
     }
 }

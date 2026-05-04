@@ -141,9 +141,28 @@ impl NebulaGraph {
     ///
     /// src 格式为 (node_id, symbol) -> value，遍历所有边，
     /// 若边的 from_node 匹配且 from_symbol 匹配，则写入 delay_buffer。
+    ///
+    /// 【安全规则】
+    /// - 对于 Purple 节点（其输出不在 src 中），主动清空其出边 delay_buffer
+    /// - 确保异常不会残留到下一 Tick
     pub fn commit_outputs(&mut self, src: &HashMap<(usize, String), f64>) {
+        // 收集待清除的 Purple 节点
+        let purple_nodes: Vec<usize> = self
+            .nodes
+            .iter()
+            .filter(|n| n.state == NodeState::Purple)
+            .map(|n| n.id)
+            .collect();
+
         for edge in &mut self.edges {
             let key = (edge.from_node, edge.from_symbol.clone());
+
+            // Purple 节点：清空出边
+            if purple_nodes.contains(&edge.from_node) {
+                edge.delay_buffer = None;
+                continue;
+            }
+
             if let Some(val) = src.get(&key) {
                 edge.delay_buffer = Some(*val);
             }

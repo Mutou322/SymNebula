@@ -1,10 +1,7 @@
-/target/
-**/__pycache__/
-*.pyc
-*.pyo
-.venv/
-*.brainstorm
-*.zip
+/target
+core/target
+macros/target
 *.swp
+*.swo
+*~
 .DS_Store
-Thumbs.db

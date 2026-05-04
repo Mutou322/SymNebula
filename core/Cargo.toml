@@ -5,4 +5,5 @@ edition = "2021"
 description = "NebulaMind — Pure mathematical formula deduction engine (no external deps)"
 
 [dependencies]
+symnebula-macros = { path = "../macros" }
 # Zero external dependencies — pure stdlib
