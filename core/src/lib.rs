@@ -15,3 +15,4 @@ pub mod state;
 pub mod graph;
 pub mod solver;
 pub mod engine;
+pub mod solver_trait;
