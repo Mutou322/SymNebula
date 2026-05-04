@@ -2,57 +2,58 @@
 ///
 /// 使用 Compute/Commit 双缓冲模式：
 /// - Compute 阶段：从 delay_buffer 只读输入，通过 SolverManager 求解
+///                dynamic 节点额外走 IntegratorManager 做时间推进
 /// - Commit 阶段：将计算结果写入 delay_buffer（锁存供下一 Tick 读取）
 ///
 /// 内核只负责调度，不负责"怎么解方程"。
-/// 所有求解能力通过 Solver trait 注入。
+/// 所有求解能力通过 Solver/Integrator trait 注入。
 
 use std::collections::HashMap;
 
 use crate::graph::NebulaGraph;
-use crate::solver_trait::SolverManager;
+use crate::solver_trait::{IntegratorManager, SolverManager, SolveResult};
 use crate::state::NodeState;
 
 pub struct Scheduler {
     pub graph: NebulaGraph,
-    /// 全局环境：(node_id, symbol) -> value
     pub env: HashMap<(usize, String), f64>,
     pub tick: usize,
-    /// 求解器管理器
     pub solver_mgr: SolverManager,
+    pub integrator_mgr: IntegratorManager,
+    /// 时间步长，用于 Integrator
+    pub dt: f64,
 }
 
 impl Scheduler {
-    /// 使用默认求解器创建调度器
+    /// 使用默认求解器和积分器创建调度器
     pub fn new(graph: NebulaGraph) -> Self {
         let solver_mgr = crate::solver_trait::default_solver_manager();
+        let integrator_mgr = crate::solver_trait::default_integrator_manager();
         Scheduler {
             graph,
             env: HashMap::new(),
             tick: 0,
             solver_mgr,
+            integrator_mgr,
+            dt: 0.01,
         }
     }
 
     /// 使用自定义求解器管理器创建调度器
     pub fn with_solver(graph: NebulaGraph, solver_mgr: SolverManager) -> Self {
+        let integrator_mgr = crate::solver_trait::default_integrator_manager();
         Scheduler {
             graph,
             env: HashMap::new(),
             tick: 0,
             solver_mgr,
+            integrator_mgr,
+            dt: 0.01,
         }
     }
 
     /// 执行一个 Tick
-    ///
-    /// 分两阶段：
-    /// 1. Compute — 从 delay_buffer 读取所有已知输入，通过 SolverManager 求解
-    /// 2. Commit — 将结果锁存到 delay_buffer，更新节点状态
     pub fn step(&mut self) {
-        // ============================================================
-        // Phase 1: Compute
-        // ============================================================
         let mut next_buffers: HashMap<(usize, String), f64> = HashMap::new();
         let mut state_changes: Vec<(usize, NodeState)> = Vec::new();
 
@@ -67,27 +68,34 @@ impl Scheduler {
             let known = self.graph.get_inputs_for_node(node_id);
             let node = &self.graph.nodes[node_idx];
 
-            // 通过 SolverManager 求解
+            // 1) 通过 SolverManager 求解
             let result = self.solver_mgr.solve_node(node, &known);
 
-            // 将结果写入 next_buffers
-            let values = result.values();
+            // 2) dynamic 节点额外走 IntegratorManager 做时间推进
+            let final_result = if node.is_dynamic {
+                let integ_result = self.integrator_mgr.step_node(node, &known, self.dt);
+                // Integrator 的结果覆盖 Solver 的输出（时间推进优先）
+                if !matches!(integ_result, SolveResult::NoOp) {
+                    integ_result
+                } else {
+                    result
+                }
+            } else {
+                result
+            };
+
+            let values = final_result.values();
             for (sym, val) in &values {
                 next_buffers.insert((node_id, sym.clone()), *val);
             }
-            // 确保 output 存在
             if !values.contains_key("output") && !values.is_empty() {
                 let first_val = values.values().next().unwrap();
                 next_buffers.insert((node_id, "output".to_string()), *first_val);
             }
 
-            let node_state = result.node_state();
+            let node_state = final_result.node_state();
             state_changes.push((node_id, node_state));
         }
-
-        // ============================================================
-        // Phase 2: Commit
-        // ============================================================
 
         for (key, val) in &next_buffers {
             self.env.insert(key.clone(), *val);
@@ -109,19 +117,16 @@ impl Scheduler {
         self.tick += 1;
     }
 
-    /// 执行多个 Tick
     pub fn step_n(&mut self, n: usize) {
         for _ in 0..n {
             self.step();
         }
     }
 
-    /// 获取某个节点某个符号的值
     pub fn get_value(&self, node_id: usize, symbol: &str) -> Option<f64> {
         self.env.get(&(node_id, symbol.to_string())).copied()
     }
 
-    /// 获取调度状态摘要
     pub fn get_status(&self) -> String {
         let total = self.graph.nodes.len();
         let green = self.graph.nodes.iter().filter(|n| n.state == NodeState::Green).count();

@@ -23,6 +23,8 @@ pub struct Node {
     pub value: Option<f64>,
     /// 求解目标变量名（如 "x"），由 engine 自动推断或用户指定
     pub solve_target: Option<String>,
+    /// 标记该节点是否参与时间推进（半隐式欧拉等）
+    pub is_dynamic: bool,
 }
 
 // ============================================================
@@ -80,6 +82,7 @@ impl NebulaGraph {
             state: NodeState::Gray,
             value: None,
             solve_target,
+            is_dynamic: false,
         });
         self.next_id += 1;
         id

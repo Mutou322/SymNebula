@@ -464,6 +464,46 @@ pub fn symplectic_euler_step(x: &mut f64, v: &mut f64, a: f64, dt: f64) {
 }
 
 // ============================================================
+// Bisection fallback
+// ============================================================
+
+/// 二分法求根。
+///
+/// 当 Newton 迭代不收敛时作为 fallback。
+/// 要求在 [low, high] 区间内 f(low) 和 f(high) 异号。
+pub fn bisection_fallback<F>(mut f: F, mut low: f64, mut high: f64, tol: f64, max_iter: usize) -> Option<f64>
+where
+    F: FnMut(f64) -> f64,
+{
+    let mut fl = f(low);
+    let fh = f(high);
+    if !fl.is_finite() || !fh.is_finite() {
+        return None;
+    }
+    if fl * fh > 0.0 {
+        return None; // 根不在区间内
+    }
+
+    for _ in 0..max_iter {
+        let mid = 0.5 * (low + high);
+        let fm = f(mid);
+        if !fm.is_finite() {
+            return None;
+        }
+        if fm.abs() < tol {
+            return Some(mid);
+        }
+        if fl * fm < 0.0 {
+            high = mid;
+        } else {
+            low = mid;
+            fl = fm;
+        }
+    }
+    Some(0.5 * (low + high))
+}
+
+// ============================================================
 // 测试
 // ============================================================
 

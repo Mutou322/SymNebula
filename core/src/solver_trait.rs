@@ -403,10 +403,24 @@ pub fn newton_solve_step(
     map.insert("output".to_string(), state.current);
 
     if state.converged {
-        SolveResult::Converged(map)
-    } else {
-        SolveResult::partial(map, PartialReason::NotConverged)
+        return SolveResult::Converged(map);
     }
+
+    // Newton 未收敛，尝试 Bisection fallback
+    let bisect_f = make_eq_function(&node.formula, target, ctx);
+    let low = state.current - 5.0;
+    let high = state.current + 5.0;
+    if let Some(root) = crate::solver::bisection_fallback(bisect_f, low, high, 1e-6, 50) {
+        state.current = root;
+        state.residual = 0.0;
+        state.converged = true;
+        let mut bmap = HashMap::new();
+        bmap.insert(target.to_string(), root);
+        bmap.insert("output".to_string(), root);
+        return SolveResult::Converged(bmap);
+    }
+
+    SolveResult::partial(map, PartialReason::NotConverged)
 }
 
 // ============================================================
@@ -478,6 +492,7 @@ mod tests {
             state: NodeState::Gray,
             value: None,
             solve_target: None,
+            is_dynamic: false,
         };
         let ctx = HashMap::new();
         let result = mgr.solve_node(&node, &ctx);
@@ -501,6 +516,7 @@ mod tests {
             state: NodeState::Gray,
             value: None,
             solve_target: None,
+            is_dynamic: false,
         };
         let solver = EvalSolver::new();
         assert!(solver.supports(&node));
@@ -526,6 +542,7 @@ mod tests {
             state: NodeState::Gray,
             value: None,
             solve_target: Some("a".to_string()),
+            is_dynamic: false,
         };
         let solver = NewtonSolver::new();
         assert!(solver.supports(&node));
@@ -551,14 +568,18 @@ mod tests {
             state: NodeState::Gray,
             value: None,
             solve_target: Some("a".to_string()),
+            is_dynamic: false,
         };
         let solver = NewtonSolver::new();
         let ctx = HashMap::new();
         let result = solver.solve(&node, &ctx);
         match result {
             SolveResult::Partial { reason, .. } => {
-                assert_eq!(reason, PartialReason::Underdetermined,
-                    "两个未知数应标记 Underdetermined");
+                assert_eq!(
+                    reason,
+                    PartialReason::Underdetermined,
+                    "两个未知数应标记 Underdetermined"
+                );
             }
             other => panic!("期望 Partial(Underdetermined), 得到 {:?}", other),
         }
@@ -573,6 +594,7 @@ mod tests {
             state: NodeState::Gray,
             value: None,
             solve_target: Some("x".to_string()),
+            is_dynamic: false,
         };
         let ctx = HashMap::new();
         let mut state = SolverState::new(3.0);
@@ -601,6 +623,7 @@ mod tests {
             state: NodeState::Gray,
             value: None,
             solve_target: None,
+            is_dynamic: false,
         };
         let mut ctx = HashMap::new();
         ctx.insert("v".to_string(), 1.0);
