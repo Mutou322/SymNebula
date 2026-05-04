@@ -19,6 +19,32 @@ use crate::guard::num::ensure_finite;
 use crate::solver::Matrix;
 use crate::state::NodeState;
 
+/// 集群缓存，按拓扑版本号惰性更新
+#[derive(Clone)]
+pub struct ClusterCache {
+    pub version: u64,
+    pub clusters: Vec<Vec<usize>>,
+}
+
+impl ClusterCache {
+    pub fn new() -> Self {
+        ClusterCache {
+            version: u64::MAX, // 强制第一次 tick 重建
+            clusters: Vec::new(),
+        }
+    }
+
+    /// 如果拓扑版本匹配则返回缓存，否则重新计算
+    pub fn resolve(&mut self, graph: &crate::graph::NebulaGraph) -> &[Vec<usize>] {
+        if self.version == graph.topology_version {
+            return &self.clusters;
+        }
+        self.clusters = ClusterDetector::detect(graph);
+        self.version = graph.topology_version;
+        &self.clusters
+    }
+}
+
 // ============================================================
 // 第 0 层：Union-Find 数据结构
 // ============================================================
@@ -619,11 +645,13 @@ impl ClusterSolverV3 {
     // ======================================================
 
     /// 编译阶段：Snapshot → Cluster Detection → for each Cluster: UF → Dep → SCC
-    pub fn compile(&mut self, graph: &NebulaGraph) {
+    ///
+    /// 使用 ClusterCache 惰性缓存，拓扑未变时跳过重复检测
+    pub fn compile(&mut self, graph: &NebulaGraph, cache: &mut ClusterCache) {
         // Phase 1: Snapshot 由调用者保证（graph 是引用，不可变）
 
-        // Phase 1.5: Cluster Detection
-        let raw_clusters = ClusterDetector::detect(graph);
+        // Phase 1.5: Cluster Detection（使用缓存）
+        let raw_clusters = cache.resolve(graph).to_vec();
 
         let mut cluster_comps: Vec<ClusterCompilation> = Vec::new();
         self.cluster_xs = Vec::new();
@@ -631,12 +659,7 @@ impl ClusterSolverV3 {
         for node_ids in &raw_clusters {
             // 构建子图（只包含该 cluster 的节点和边）
             let node_set: HashSet<usize> = node_ids.iter().copied().collect();
-            let sub_nodes: Vec<&crate::graph::Node> = graph.nodes.iter()
-                .filter(|n| node_set.contains(&n.id))
-                .collect();
-            let sub_edges: Vec<&crate::graph::Synapse> = graph.edges.iter()
-                .filter(|e| node_set.contains(&e.from_node) && node_set.contains(&e.to_node))
-                .collect();
+            // UF 只需 node_set 过滤，直接复用 graph 引用
 
             // 用子图构建临时 NebulaGraph 供 UF 使用
             // 但 UF 只需要 edges 和 nodes，直接从原 graph 过滤引用
@@ -716,19 +739,22 @@ impl ClusterSolverV3 {
     }
 
     // ======================================================
-    // Phase 3: Solve — 每个 cluster 独立 tick
+    // Phase 3: Solve — 每个 cluster 独立 tick + 原子提交
     // ======================================================
 
     /// 执行一次所有 cluster 的 Block Newton 迭代
     ///
-    /// 返回每个 cluster 的节点状态和平均残差
+    /// 返回每个 cluster 的节点状态和平均残差。
+    /// 原子提交保证：失败集群不修改 cluster_xs，保留旧值供下 Tick 使用。
     pub fn tick(&mut self) -> ClusterTickResult {
         let comp = match &self.compilation {
             Some(c) => c,
-            None => return ClusterTickResult {
-                cluster_states: Vec::new(),
-                avg_residual: f64::INFINITY,
-            },
+            None => {
+                return ClusterTickResult {
+                    cluster_states: Vec::new(),
+                    avg_residual: f64::INFINITY,
+                }
+            }
         };
 
         let mut all_states: Vec<Vec<(usize, NodeState)>> = Vec::new();
@@ -736,40 +762,47 @@ impl ClusterSolverV3 {
         let mut total_cons = 0;
 
         for (ci, cluster_comp) in comp.clusters.iter().enumerate() {
-            let mut cluster_states: Vec<(usize, NodeState)> = Vec::new();
-            let x_cluster = &mut self.cluster_xs[ci];
+            // ---- 原子提交：先在 temp_x 上求解 ----
+            let old_x = self.cluster_xs[ci].clone();
+            let mut temp_x = old_x.clone();
             let mut cluster_has_singular = false;
             let mut cluster_has_unconverged = false;
 
-            for (_block_idx, (cons_indices, var_indices)) in cluster_comp.blocks.iter().enumerate() {
+            for (_block_idx, (cons_indices, var_indices)) in cluster_comp.blocks.iter().enumerate()
+            {
                 let block_cons: Vec<&CompiledConstraint> = cons_indices
                     .iter()
                     .map(|&cid| &cluster_comp.constraints[cid])
                     .collect();
 
-                match self.newton.step_block(&block_cons, var_indices, x_cluster) {
-                    Ok(converged) => {
-                        for &cid in cons_indices {
-                            let res = (cluster_comp.constraints[cid].func)(x_cluster).abs();
-                            total_res += res;
-                            total_cons += 1;
+                // Tick 内多步迭代
+                let mut block_converged = false;
+                for _ in 0..self.newton.max_iter {
+                    match self.newton.step_block(&block_cons, var_indices, &mut temp_x) {
+                        Ok(converged) => {
+                            block_converged = converged;
+                            if converged {
+                                break;
+                            }
                         }
-                        if !converged {
-                            cluster_has_unconverged = true;
-                        }
-                    }
-                    Err(_) => {
-                        cluster_has_singular = true;
-                        for &cid in cons_indices {
-                            let res = (cluster_comp.constraints[cid].func)(x_cluster).abs();
-                            total_res += res;
-                            total_cons += 1;
+                        Err(_) => {
+                            cluster_has_singular = true;
+                            break;
                         }
                     }
                 }
+                for &cid in cons_indices {
+                    let res = (cluster_comp.constraints[cid].func)(&temp_x).abs();
+                    total_res += res;
+                    total_cons += 1;
+                }
+                if !block_converged && !cluster_has_singular {
+                    cluster_has_unconverged = true;
+                }
             }
 
-            // 决定 cluster 内各节点的颜色
+            eprintln!("DBG ci={} sing={} unconv={} blocks={} temp_x={:?}", ci, cluster_has_singular, cluster_has_unconverged, cluster_comp.blocks.len(), temp_x);
+            // ---- 原子提交决策 ----
             let node_color = if cluster_has_singular {
                 NodeState::Purple
             } else if cluster_has_unconverged {
@@ -780,21 +813,36 @@ impl ClusterSolverV3 {
                 NodeState::Green
             };
 
-            for &nid in &cluster_comp.node_ids {
-                cluster_states.push((nid, node_color.clone()));
+            // 仅成功时写回 cluster_xs，失败/未收敛保留旧值（Yellow 状态保持）
+            if node_color == NodeState::Green {
+                self.cluster_xs[ci].copy_from_slice(&temp_x);
+                if ci == 0 {
+                    
+                }
+            } else {
+                if ci == 0 {
+                    
+                }
             }
-            all_states.push(cluster_states);
+
+            // Purple/Yellow：不写回，cluster_xs[ci] 保留上一 Tick 的值
+            // Yellow 的 temp_x 可作为下一 Tick 初值（已保留在 temp_x，但 cluster_xs 仍是旧值）
+            // 这一步实现"逐步逼近"链式推进
+
+            for &nid in &cluster_comp.node_ids {
+                all_states.push(vec![(nid, node_color.clone())]);
+            }
         }
 
         ClusterTickResult {
             cluster_states: all_states,
-            avg_residual: if total_cons > 0 { total_res / total_cons as f64 } else { 0.0 },
+            avg_residual: if total_cons > 0 {
+                total_res / total_cons as f64
+            } else {
+                0.0
+            },
         }
     }
-
-    // ======================================================
-    // Phase 4: Commit（查询接口）
-    // ======================================================
 
     pub fn get_value(&self, node_id: usize, symbol: &str) -> Option<f64> {
         let comp = self.compilation.as_ref()?;
@@ -943,7 +991,8 @@ mod tests {
         g.add_edge_with_default(n1, "next_a", n1, "a", 0.0);
 
         let mut solver = ClusterSolverV3::new();
-        solver.compile(&g);
+        let mut cache = ClusterCache::new();
+        solver.compile(&g, &mut cache);
         let comp = solver.compilation.as_ref().unwrap();
         assert!(comp.clusters[0].blocks.len() >= 1);
     }
@@ -1020,7 +1069,8 @@ mod tests {
         g.add_edge_with_default(n1, "x", n2, "x", 0.0);
 
         let mut solver = ClusterSolverV3::new();
-        solver.compile(&g);
+        let mut cache = ClusterCache::new();
+        solver.compile(&g, &mut cache);
 
         // 多次 tick 直到收敛
         for _ in 0..30 {
@@ -1048,7 +1098,8 @@ mod tests {
         g.add_node(parse_simple_eq("x + 2 = 10").unwrap()); // x=8
 
         let mut solver = ClusterSolverV3::new();
-        solver.compile(&g);
+        let mut cache = ClusterCache::new();
+        solver.compile(&g, &mut cache);
 
         for _ in 0..30 {
             let result = solver.tick();
@@ -1082,7 +1133,8 @@ mod tests {
         g.add_edge_with_default(n0, "b", n1, "b", 2.0);
 
         let mut solver = ClusterSolverV3::new();
-        solver.compile(&g);
+        let mut cache = ClusterCache::new();
+        solver.compile(&g, &mut cache);
 
         for _ in 0..50 {
             let result = solver.tick();
@@ -1111,7 +1163,8 @@ mod tests {
         let original_edges = g.edges.len();
 
         let mut solver = ClusterSolverV3::new();
-        solver.compile(&g);
+        let mut cache = ClusterCache::new();
+        solver.compile(&g, &mut cache);
 
         assert_eq!(g.nodes.len(), original_nodes, "compile 不应修改 graph nodes");
         assert_eq!(g.edges.len(), original_edges, "compile 不应修改 graph edges");
@@ -1125,7 +1178,8 @@ mod tests {
         g.add_node(parse_simple_eq("x + y = 10").unwrap());
 
         let mut solver = ClusterSolverV3::new();
-        solver.compile(&g);
+        let mut cache = ClusterCache::new();
+        solver.compile(&g, &mut cache);
 
         // tick 不应 panic
         let result = solver.tick();

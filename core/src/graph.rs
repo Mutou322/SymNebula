@@ -55,6 +55,8 @@ pub struct NebulaGraph {
     pub nodes: Vec<Node>,
     pub edges: Vec<Synapse>,
     next_id: usize,
+    /// 拓扑版本号：节点/边新增或删除时递增，数值状态变化时不递增
+    pub topology_version: u64,
 }
 
 impl NebulaGraph {
@@ -63,6 +65,7 @@ impl NebulaGraph {
             nodes: vec![],
             edges: vec![],
             next_id: 0,
+            topology_version: 0,
         }
     }
 
@@ -85,6 +88,7 @@ impl NebulaGraph {
             is_dynamic: false,
         });
         self.next_id += 1;
+        self.topology_version += 1;
         id
     }
 
@@ -98,6 +102,7 @@ impl NebulaGraph {
             delay_buffer: None,
             default_value: None,
         });
+        self.topology_version += 1;
     }
 
     /// 添加有向边并设置默认值
@@ -117,6 +122,7 @@ impl NebulaGraph {
             delay_buffer: None,
             default_value: Some(default_value),
         });
+        self.topology_version += 1;
     }
 
     /// 获取目标节点在 Compute 阶段的已知输入
