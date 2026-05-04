@@ -174,8 +174,9 @@ impl Lexer {
                 break;
             }
         }
-        // 如果符号长度 > 1 且全为字母，只取第一个字符（隐式乘法拆包）
-        if s.len() > 1 && s.chars().all(|c| c.is_ascii_alphabetic()) {
+        // 如果符号长度 == 2 且全为小写字母（如 xy），
+        // 这是隐式乘法场景，只取第一个字符
+        if s.len() == 2 && s.chars().all(|c| c.is_ascii_lowercase()) {
             self.pos = start + 1;
             s.chars().next().unwrap().to_string()
         } else {

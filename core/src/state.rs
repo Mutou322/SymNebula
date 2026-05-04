@@ -5,7 +5,7 @@
 /// Green  — 输出有效，计算成功
 /// Purple — 奇异态，数学异常（除零/维度不匹配），已安全切断
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum NodeState {
     Gray,
     Yellow,
@@ -24,6 +24,27 @@ impl NodeState {
             NodeState::Yellow => "yellow",
             NodeState::Green => "green",
             NodeState::Purple => "purple",
+        }
+    }
+}
+
+/// Newton 迭代求解器的单步状态
+///
+/// 每个 Eq 节点持有一个 SolverState，每 Tick 推进一步。
+/// 快机器上收敛快，慢机器上收敛慢，结果一致。
+#[derive(Debug, Clone)]
+pub struct SolverState {
+    pub current: f64,
+    pub residual: f64,
+    pub converged: bool,
+}
+
+impl SolverState {
+    pub fn new(init: f64) -> Self {
+        Self {
+            current: init,
+            residual: f64::MAX,
+            converged: false,
         }
     }
 }

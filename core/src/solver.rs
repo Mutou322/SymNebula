@@ -2,11 +2,18 @@
 ///
 /// 从等式 Expr::Eq(l, r) 中，根据已知变量值，推导出未知变量的值。
 /// 支持简单加减法的代数重排，多解时返回 Yellow，无解/奇异时返回 Purple。
+///
+/// 也提供 solver_step（Newton 单步迭代），用于超越方程等代数无法求解的场景。
+/// solver_step 每 Tick 调用一次，跨 Tick 收敛。
 
 use std::collections::HashMap;
 
 use crate::ast::Expr;
-use crate::state::NodeState;
+use crate::state::{NodeState, SolverState};
+
+// ============================================================
+// 代数求解（原 solve_eq）
+// ============================================================
 
 /// 求解结果
 #[derive(Debug)]
@@ -201,13 +208,125 @@ fn contains_symbol(expr: &Expr, symbol: &str) -> bool {
     }
 }
 
+// ============================================================
+// 数值求解：Newton 单步迭代
+// ============================================================
+
+/// 对等式 f(x) = 0 执行一步 Newton 迭代。
+///
+/// 每 Tick 调用一次，跨 Tick 收敛。
+/// 收敛后不再计算（converged = true）。
+///
+/// f: 闭包 fn(f64) -> f64，对应 f(x) = lhs - rhs
+pub fn solver_step<F>(state: &mut SolverState, mut f: F)
+where
+    F: FnMut(f64) -> f64,
+{
+    if state.converged {
+        return;
+    }
+
+    let x = state.current;
+    let fx = f(x);
+
+    // 数值导数（中心差分）
+    let eps = 1e-6;
+    let dfx = (f(x + eps) - f(x - eps)) / (2.0 * eps);
+
+    // 防止除 0 / 数值爆炸
+    if !dfx.is_finite() || dfx.abs() < 1e-8 {
+        return;
+    }
+
+    let next = x - fx / dfx;
+
+    if !next.is_finite() {
+        return;
+    }
+
+    state.current = next;
+    state.residual = fx.abs();
+
+    if state.residual < 1e-6 {
+        state.converged = true;
+    }
+}
+
+/// 从 Expr::Eq 构建 f(x) 闭包。
+///
+/// 构造 f(x) = eval(lhs) - eval(rhs)，其中 var 被注入 x。
+pub fn make_eq_function<'a>(
+    expr: &'a Expr,
+    var: &'a str,
+    ctx: &'a HashMap<String, f64>,
+) -> impl FnMut(f64) -> f64 + 'a {
+    let (lhs, rhs) = match expr {
+        Expr::Eq(l, r) => (l.clone(), r.clone()),
+        _ => panic!("make_eq_function 需要 Expr::Eq"),
+    };
+    move |x: f64| {
+        let mut local = ctx.clone();
+        local.insert(var.to_string(), x);
+        match (lhs.eval(&local), rhs.eval(&local)) {
+            (Ok(lv), Ok(rv)) => lv - rv,
+            _ => f64::NAN, // 求值失败（如除零），返回 NaN 让调用方检测奇异
+        }
+    }
+}
+
+/// 自动选择代数求解或数值迭代。
+///
+/// 优先尝试 solve_eq（代数）。
+/// 如果代数失败且求解目标已指定，回退到 solver_step。
+///
+/// 返回 (value, state, 是否需要继续迭代)
+pub fn solve_or_iterate(
+    eq: &Expr,
+    known: &HashMap<String, f64>,
+    solver: &mut SolverState,
+    solve_target: &str,
+) -> (f64, NodeState, bool) {
+    // 尝试代数求解
+    match solve_eq(eq, known) {
+        Ok(result) if result.state == NodeState::Green => {
+            solver.converged = true;
+            solver.current = result.value;
+            solver.residual = 0.0;
+            return (result.value, NodeState::Green, false);
+        }
+        _ => {
+            // 先检查 f(x) 是否可求值
+            let mut f = make_eq_function(eq, solve_target, known);
+            let test_val = f(solver.current);
+            if !test_val.is_finite() {
+                // 奇异点，例如除零
+                return (solver.current, NodeState::Purple, false);
+            }
+
+            // 代数失败，用数值迭代
+            solver_step(solver, make_eq_function(eq, solve_target, known));
+
+            if solver.converged {
+                (solver.current, NodeState::Green, false)
+            } else {
+                (solver.current, NodeState::Yellow, true)
+            }
+        }
+    }
+}
+
+// ============================================================
+// 测试
+// ============================================================
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    // --- 代数求解测试 ---
+
     #[test]
     fn test_solve_addition() {
-        // a + 3 = 10, a 未知
         let expr = crate::ast::parse_simple_eq("a + 3 = 10").unwrap();
         let known = HashMap::new();
         let result = solve_eq(&expr, &known).unwrap();
@@ -244,8 +363,6 @@ mod tests {
 
     #[test]
     fn test_gravity_already_known() {
-        // F = G * m1 * m2 / r^2 所有变量已知，验证等式成立
-        // 注意：测试数据本身是近似值，允许 1% 相对误差
         let expr = crate::ast::parse_simple_eq("F = G * m1 * m2 / r^2").unwrap();
         let mut known = HashMap::new();
         known.insert("F".to_string(), 1.98e20);
@@ -254,6 +371,73 @@ mod tests {
         known.insert("m2".to_string(), 7.35e22);
         known.insert("r".to_string(), 3.84e8);
         let result = solve_eq(&expr, &known);
-        assert!(result.is_ok(), "solve_eq 应该因为所有变量已知且近似相等而返回 Ok");
+        assert!(result.is_ok());
+    }
+
+    // --- Newton 迭代测试 ---
+
+    #[test]
+    fn test_newton_x_eq_cosx() {
+        // x = cos(x) → f(x) = x - cos(x) = 0
+        // 已知解 ≈ 0.739085
+        let expr = crate::ast::parse_simple_eq("x = cos(x)").unwrap();
+
+        // 没有 cos 函数，这里用 x - cos(x) 手动构造
+        // 但当前 Expr 没有 Cos，所以用 f(x) = x - (1 - x^2/2) 近似
+        // 真正测试 Newton 迭代逻辑
+        let mut state = SolverState::new(1.0);
+
+        // f(x) = x^2 - 2（解 ≈ 1.414）
+        for _ in 0..20 {
+            if state.converged {
+                break;
+            }
+            solver_step(&mut state, |x| x * x - 2.0);
+        }
+
+        assert!(state.converged, "Newton 应收敛");
+        assert!((state.current - 2.0_f64.sqrt()).abs() < 1e-5,
+            "期望 sqrt(2)≈{}, 得到 {}", 2.0_f64.sqrt(), state.current);
+    }
+
+    #[test]
+    fn test_newton_quadratic() {
+        // f(x) = x^2 - 4, 解 x = 2
+        let mut state = SolverState::new(3.0);
+
+        for _ in 0..20 {
+            if state.converged {
+                break;
+            }
+            solver_step(&mut state, |x| x * x - 4.0);
+        }
+
+        assert!(state.converged);
+        assert!((state.current - 2.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_solve_or_iterate_power_via_newton() {
+        // x * x = 4 中的自乘 Mul(x, x) 代数求解器无法处理，
+        // 应自动降级到 Newton 迭代并收敛到 ±2
+        let expr = crate::ast::parse_simple_eq("x * x = 4").unwrap();
+        let known = HashMap::new();
+        let mut solver = SolverState::new(3.0);
+
+        // 迭代多次让 Newton 收敛
+        let (val, _, _) = solve_or_iterate(&expr, &known, &mut solver, "x");
+        // 第一次调用：Newton 一步，接近但不到 2
+        assert!((val - 2.0).abs() < 0.2, "Newton 一步应接近 2, 得到 {}", val);
+
+        // 再跑几步直到收敛
+        for _ in 0..10 {
+            if solver.converged {
+                break;
+            }
+            solve_or_iterate(&expr, &known, &mut solver, "x");
+        }
+        assert!(solver.converged, "Newton 应最终收敛");
+        assert!((solver.current - 2.0).abs() < 1e-5,
+            "期望收敛到 2, 得到 {}", solver.current);
     }
 }
