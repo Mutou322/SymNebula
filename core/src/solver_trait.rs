@@ -1,59 +1,57 @@
 /// 求解器模块化接口 + 标准实现
 ///
-/// Solver trait 将求解逻辑与 Tick/Graph/Engine 解耦：
-///   - StdNewtonSolver: 标准实现，多变量 Newton + 半隐式欧拉
-///   - 未来可加 SparseSolver / GPUSolver，不改动核心引擎
+/// Solver trait 将求解逻辑与 Tick/Graph/Engine 完全解耦。
+/// 内核只负责调度，不负责"怎么解方程"。
 ///
-/// NodeContext: 节点运行时上下文，封装变量读写和默认值
+/// 架构：
+///   SolverManager → 遍历 Solver → supports() → solve() → SolveResult
+///
+/// 内置 Solver：
+///   - EvalSolver:    纯表达式求值（无等号）
+///   - NewtonSolver:  等式节点，代数求解 + Newton 降级
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 
 use crate::ast::Expr;
 use crate::graph::Node;
-use crate::solver::{symplectic_euler_step, Matrix};
+use crate::solver::{solve_eq, solver_step, make_eq_function};
+use crate::state::{NodeState, SolverState};
 
 // ============================================================
-// NodeContext
+// SolveResult — 统一求解输出
 // ============================================================
 
-/// 节点运行时上下文，封装变量读写和默认值
+/// 求解器的统一输出。
 #[derive(Debug, Clone)]
-pub struct NodeContext {
-    values: HashMap<String, f64>,
+pub enum SolveResult {
+    /// 完全收敛，携带输出值 (symbol -> value)
+    Converged(HashMap<String, f64>),
+    /// 部分收敛或未完全收敛（标黄）
+    Partial(HashMap<String, f64>),
+    /// 求解失败（标紫）
+    Failed(String),
+    /// 无操作（标灰）
+    NoOp,
 }
 
-impl NodeContext {
-    pub fn new() -> Self {
-        NodeContext {
-            values: HashMap::new(),
+impl SolveResult {
+    /// 提取输出值
+    pub fn values(&self) -> HashMap<String, f64> {
+        match self {
+            SolveResult::Converged(m) | SolveResult::Partial(m) => m.clone(),
+            _ => HashMap::new(),
         }
     }
 
-    /// 从已知值构建上下文
-    pub fn from_map(values: HashMap<String, f64>) -> Self {
-        NodeContext { values }
-    }
-
-    pub fn get(&self, name: &str) -> f64 {
-        *self.values.get(name).unwrap_or(&0.0)
-    }
-
-    pub fn set(&mut self, name: &str, val: f64) {
-        self.values.insert(name.to_string(), val);
-    }
-
-    pub fn is_defined(&self, name: &str) -> bool {
-        self.values.contains_key(name)
-    }
-
-    /// 获取所有已知变量的引用
-    pub fn values(&self) -> &HashMap<String, f64> {
-        &self.values
-    }
-
-    /// 消费 self，返回底层 map
-    pub fn into_map(self) -> HashMap<String, f64> {
-        self.values
+    /// 映射到节点状态
+    pub fn node_state(&self) -> NodeState {
+        match self {
+            SolveResult::Converged(_) => NodeState::Green,
+            SolveResult::Partial(_) => NodeState::Yellow,
+            SolveResult::Failed(_) => NodeState::Purple,
+            SolveResult::NoOp => NodeState::Gray,
+        }
     }
 }
 
@@ -65,310 +63,194 @@ impl NodeContext {
 ///
 /// 实现此 trait 的结构体可替换求解策略，不依赖 Tick/Graph/Engine。
 pub trait Solver {
-    /// 对节点执行一步求解。
-    ///
-    /// node:  当前节点（含 formula, solver_state, value）
-    /// ctx:   运行时上下文（已知变量的值）
-    /// dt:    时间步长（用于动态节点半隐式欧拉）
-    ///
-    /// 返回 true 表示求解成功/收敛，false 表示奇异或失败
-    fn solve_step(&mut self, node: &mut Node, ctx: &NodeContext, dt: f64) -> bool;
+    /// 是否支持该节点
+    fn supports(&self, node: &Node) -> bool;
+
+    /// 执行一次求解。
+    /// ctx: 节点输入端口的值（来自 delay_buffer）
+    fn solve(&self, node: &Node, ctx: &HashMap<String, f64>) -> SolveResult;
 }
 
 // ============================================================
-// Expr 辅助：自动选择求解目标
+// SolverManager
 // ============================================================
 
-/// 从 Expr 中自动选出未被上下文确定的符号作为求解目标。
+/// 求解器管理器。
 ///
-/// 收集 Eq 的所有符号，过滤掉 ctx 中已有值的，返回剩余未知。
-/// 当前只返回第一个未知符号（单变量），后续扩展可返回全部。
-pub fn auto_select_solve_targets(expr: &Expr, ctx: &NodeContext) -> Vec<String> {
-    expr.symbols()
-        .into_iter()
-        .filter(|s| !ctx.is_defined(s))
-        .collect()
+/// 持有一组 Solver，遍历匹配执行。
+/// 内核只需调用 solve_node，不关心内部选用了哪个求解器。
+pub struct SolverManager {
+    solvers: Vec<Box<dyn Solver>>,
 }
 
-/// 从 Expr 中提取未知符号并返回第一个，作为 solve_target 的字符串
-pub fn first_unknown(expr: &Expr, ctx: &NodeContext) -> Option<String> {
-    let targets = auto_select_solve_targets(expr, ctx);
-    targets.into_iter().next()
-}
+impl SolverManager {
+    pub fn new(solvers: Vec<Box<dyn Solver>>) -> Self {
+        SolverManager { solvers }
+    }
 
-// ============================================================
-// LocalContext：节点局部上下文快照
-// ============================================================
-
-/// Newton 迭代内部的局部上下文。
-///
-/// 从 NodeContext 快照节点输入端口的符号值，迭代中的 ctx.set
-/// 只作用在此副本上，不影响全局上下文和其他节点。
-#[derive(Debug, Clone)]
-pub struct LocalContext {
-    values: HashMap<String, f64>,
-}
-
-impl LocalContext {
-    /// 从全局上下文快照该节点的输入符号
-    pub fn from_node(node: &Node, global: &NodeContext) -> Self {
-        let mut values = HashMap::new();
-        // 将全局上下文中该节点公式涉及的所有符号快照过来
-        let syms = node.formula.symbols();
-        for s in &syms {
-            if global.is_defined(s) {
-                values.insert(s.clone(), global.get(s));
+    /// 遍历所有 Solver，找到第一个 supports 的并执行。
+    pub fn solve_node(&self, node: &Node, ctx: &HashMap<String, f64>) -> SolveResult {
+        for solver in &self.solvers {
+            if solver.supports(node) {
+                return solver.solve(node, ctx);
             }
         }
-        // 也纳入节点自身的当前值
-        if let Some(v) = node.value {
-            if let Some(target) = &node.solve_target {
-                values.entry(target.clone()).or_insert(v);
-            }
-        }
-        LocalContext { values }
-    }
-
-    /// 从已知值的 HashMap 构建（兼容 engine 的 known）
-    pub fn from_map(values: HashMap<String, f64>) -> Self {
-        LocalContext { values }
-    }
-
-    pub fn get(&self, name: &str) -> f64 {
-        *self.values.get(name).unwrap_or(&0.0)
-    }
-
-    pub fn set(&mut self, name: &str, val: f64) {
-        self.values.insert(name.to_string(), val);
-    }
-
-    pub fn is_defined(&self, name: &str) -> bool {
-        self.values.contains_key(name)
-    }
-
-    /// 转为 HashMap 供外部使用
-    pub fn into_map(self) -> HashMap<String, f64> {
-        self.values
-    }
-
-    /// 获取底层值的引用（兼容 make_eq_function 接口）
-    pub fn as_known(&self) -> &HashMap<String, f64> {
-        &self.values
+        SolveResult::NoOp
     }
 }
 
 // ============================================================
-// StdNewtonSolver
+// EvalSolver — 纯表达式求值
 // ============================================================
 
-/// 标准 Newton 求解器。
+/// 纯表达式求解器。
 ///
-/// 使用已有的 solve_eq 做代数求解，失败则降级到单变量 Newton。
-/// 支持半隐式欧拉更新动态节点。
-pub struct StdNewtonSolver;
+/// 处理所有无等号的节点（Number、纯表达式）。
+pub struct EvalSolver;
 
-impl StdNewtonSolver {
+impl EvalSolver {
     pub fn new() -> Self {
-        StdNewtonSolver
+        EvalSolver
     }
 }
 
-impl Solver for StdNewtonSolver {
-    fn solve_step(&mut self, node: &mut Node, ctx: &NodeContext, dt: f64) -> bool {
-        let formula = &node.formula;
-        let known = ctx.values();
-        let solve_target = node.solve_target.clone();
+impl Solver for EvalSolver {
+    fn supports(&self, node: &Node) -> bool {
+        !matches!(node.formula, Expr::Eq(_, _))
+    }
 
-        match formula {
-            Expr::Eq(_, _) => {
-                // 先代数求解
-                match crate::solver::solve_eq(formula, known) {
-                    Ok(result) if result.state == crate::state::NodeState::Green => {
-                        node.solver_state.converged = true;
-                        node.solver_state.current = result.value;
-                        node.value = Some(result.value);
-                        true
-                    }
-                    _ => {
-                        // 降级到 Newton，使用局部快照避免污染全局
-                        let target = solve_target.as_deref().unwrap_or("");
-                        if target.is_empty() {
-                            return false;
-                        }
-                        let mut local = LocalContext::from_node(node, ctx);
-
-                        // 检查 f(x) 是否可求值（在局部上下文中）
-                        let mut test_f = crate::solver::make_eq_function(formula, target, local.as_known());
-                        let test_val = test_f(node.solver_state.current);
-                        if !test_val.is_finite() {
-                            return false;
-                        }
-
-                        crate::solver::solver_step(
-                            &mut node.solver_state,
-                            crate::solver::make_eq_function(formula, target, local.as_known()),
-                        );
-
-                        if node.solver_state.converged {
-                            node.value = Some(node.solver_state.current);
-                        } else {
-                            node.value = Some(node.solver_state.current);
-                        }
-                        node.solver_state.converged
-                    }
-                }
-            }
+    fn solve(&self, node: &Node, ctx: &HashMap<String, f64>) -> SolveResult {
+        match &node.formula {
             Expr::Number(n) => {
-                node.solver_state.converged = true;
-                node.solver_state.current = *n;
-                node.value = Some(*n);
-                true
+                let mut map = HashMap::new();
+                map.insert("output".to_string(), *n);
+                SolveResult::Converged(map)
             }
-            _ => {
-                // 纯表达式 eval
-                match formula.eval(known) {
-                    Ok(val) => {
-                        node.solver_state.converged = true;
-                        node.solver_state.current = val;
-                        node.value = Some(val);
-                        true
-                    }
-                    Err(_) => false,
+            expr => match expr.eval(ctx) {
+                Ok(val) => {
+                    let mut map = HashMap::new();
+                    map.insert("output".to_string(), val);
+                    SolveResult::Converged(map)
                 }
-            }
+                Err(e) => SolveResult::Failed(e),
+            },
         }
     }
 }
 
 // ============================================================
-// 多变量 Newton + Jacobian 的 Solver 扩展
+// NewtonSolver — 等式求解器
 // ============================================================
 
-/// 多变量 Newton 求解器。
+/// 等式求解器。
 ///
-/// 自动选择未知目标，构建 Jacobian，高斯消元求解。
-pub struct MultiNewtonSolver;
+/// 优先代数求解（solve_eq），失败则降级到单变量 Newton。
+/// 内部持有每个节点的 SolverState，独立维护迭代状态。
+pub struct NewtonSolver {
+    /// node_id -> SolverState
+    states: RefCell<HashMap<usize, SolverState>>,
+}
 
-impl MultiNewtonSolver {
+impl NewtonSolver {
     pub fn new() -> Self {
-        MultiNewtonSolver
+        NewtonSolver {
+            states: RefCell::new(HashMap::new()),
+        }
+    }
+
+    /// 获取或创建节点的 SolverState
+    fn get_state(&self, node_id: usize, init: f64) -> SolverState {
+        self.states
+            .borrow_mut()
+            .entry(node_id)
+            .or_insert_with(|| SolverState::new(init))
+            .clone()
+    }
+
+    /// 更新 SolverState
+    fn set_state(&self, node_id: usize, state: SolverState) {
+        self.states.borrow_mut().insert(node_id, state);
     }
 }
 
-impl Solver for MultiNewtonSolver {
-    fn solve_step(&mut self, node: &mut Node, ctx: &NodeContext, dt: f64) -> bool {
-        let formula = &node.formula;
+impl Solver for NewtonSolver {
+    fn supports(&self, node: &Node) -> bool {
+        matches!(node.formula, Expr::Eq(_, _))
+    }
 
-        match formula {
-            Expr::Eq(_, _) => {
-                let unknowns = auto_select_solve_targets(formula, ctx);
-                if unknowns.is_empty() {
-                    // 全部已知，验证
-                    let known = ctx.values();
-                    match crate::solver::solve_eq(formula, known) {
-                        Ok(r) if r.state == crate::state::NodeState::Green => {
-                            node.value = Some(r.value);
-                            return true;
-                        }
-                        _ => return false,
-                    }
-                }
-
-                let n = unknowns.len();
-                if n > 5 {
-                    // 超过 5 变量，退回到单变量 Newton
-                    return StdNewtonSolver.solve_step(node, ctx, dt);
-                }
-
-                let known_map = ctx.values();
-
-                // 构造状态向量
-                let mut state: Vec<f64> = unknowns
-                    .iter()
-                    .map(|s| known_map.get(s).copied().unwrap_or(0.0))
-                    .collect();
-
-                // 构造闭包 f(state) -> vec of residuals
-                let mut f = |x: &Vec<f64>| -> Vec<f64> {
-                    let mut local = known_map.clone();
-                    for (sym, val) in unknowns.iter().zip(x.iter()) {
-                        local.insert(sym.clone(), *val);
-                    }
-                    if let Expr::Eq(lhs, rhs) = formula {
-                        let lv = lhs.eval(&local).unwrap_or(f64::NAN);
-                        let rv = rhs.eval(&local).unwrap_or(f64::NAN);
-                        vec![lv - rv]
-                    } else {
-                        vec![0.0]
-                    }
-                };
-
-                // 对于单变量 Eq，f 返回一个标量；多变量方程组需扩展
-                // 当前 Expr 没有多方程支持，用单变量 Newton
-                for _ in 0..20 {
-                    if state.len() == 1 {
-                        let fx = f(&state);
-                        if fx[0].abs() < 1e-6 {
-                            break;
-                        }
-                        // 数值导数
-                        let eps = 1e-6;
-                        let mut x_eps = state.clone();
-                        x_eps[0] += eps;
-                        let fx_eps = f(&x_eps);
-                        let df = (fx_eps[0] - fx[0]) / eps;
-                        if !df.is_finite() || df.abs() < 1e-10 {
-                            break;
-                        }
-                        state[0] -= fx[0] / df;
-                    } else {
-                        // n > 1: 构建 Jacobian 矩阵
-                        let fx = f(&state);
-                        if fx.iter().all(|v| v.abs() < 1e-6) {
-                            break;
-                        }
-                        let mut jac = Matrix::new(n, n);
-                        let eps = 1e-6;
-                        for i in 0..n {
-                            let mut x_eps = state.clone();
-                            x_eps[i] += eps;
-                            let fx_eps = f(&x_eps);
-                            for j in 0..n {
-                                jac.set(j, i, (fx_eps[j] - fx[j]) / eps);
-                            }
-                        }
-                        let rhs: Vec<f64> = fx.iter().map(|v| -v).collect();
-                        if let Ok(dx) = jac.solve(rhs) {
-                            for i in 0..n {
-                                state[i] += dx[i];
-                            }
-                        } else {
-                            break;
-                        }
-                    }
-                }
-
-                // 更新节点值
-                if !state.is_empty() {
-                    node.solver_state.current = state[0];
-                    node.solver_state.converged = true;
-                    node.value = Some(state[0]);
-                }
-                true
+    fn solve(&self, node: &Node, ctx: &HashMap<String, f64>) -> SolveResult {
+        // 先代数求解
+        match solve_eq(&node.formula, ctx) {
+            Ok(result) if !result.symbol.is_empty() => {
+                let mut map = HashMap::new();
+                map.insert(result.symbol.clone(), result.value);
+                map.insert("output".to_string(), result.value);
+                SolveResult::Converged(map)
             }
-            _ => {
-                // 非等式节点走 eval
-                let known = ctx.values();
-                match formula.eval(known) {
-                    Ok(val) => {
-                        node.value = Some(val);
-                        true
+            Ok(_) => {
+                // 所有变量已知且验证通过
+                if let Expr::Eq(l, r) = &node.formula {
+                    if let (Ok(lv), Ok(rv)) = (l.eval(ctx), r.eval(ctx)) {
+                        let mut map = HashMap::new();
+                        map.insert("output".to_string(), (lv + rv) / 2.0);
+                        return SolveResult::Converged(map);
                     }
-                    Err(_) => false,
                 }
+                SolveResult::Failed("等式验证失败".into())
+            }
+            Err(_) => {
+                // 降级到 Newton
+                let mut state = self.get_state(node.id, 0.0);
+                let result = newton_solve_step(node, ctx, &mut state);
+                self.set_state(node.id, state);
+                result
             }
         }
     }
+}
+
+/// 实际执行 Newton 一步（可从外部调用）
+pub fn newton_solve_step(
+    node: &Node,
+    ctx: &HashMap<String, f64>,
+    state: &mut SolverState,
+) -> SolveResult {
+    let target = node.solve_target.as_deref().unwrap_or("");
+    if target.is_empty() {
+        return SolveResult::Failed("无求解目标".into());
+    }
+
+    let mut f = make_eq_function(&node.formula, target, ctx);
+    let test_val = f(state.current);
+    if !test_val.is_finite() {
+        return SolveResult::Failed("奇异点（除零）".into());
+    }
+
+    solver_step(state, make_eq_function(&node.formula, target, ctx));
+
+    let mut map = HashMap::new();
+    map.insert(target.to_string(), state.current);
+    map.insert("output".to_string(), state.current);
+
+    if state.converged {
+        SolveResult::Converged(map)
+    } else {
+        SolveResult::Partial(map)
+    }
+}
+
+// ============================================================
+// 便捷构造函数
+// ============================================================
+
+/// 创建默认求解器管理器：EvalSolver + NewtonSolver
+pub fn default_solver_manager() -> (SolverManager, NewtonSolver) {
+    let newton = NewtonSolver::new();
+    let mgr = SolverManager::new(vec![
+        Box::new(EvalSolver::new()),
+        Box::new(NewtonSolver::new()),
+    ]);
+    (mgr, newton)
 }
 
 // ============================================================
@@ -381,45 +263,101 @@ mod tests {
     use crate::ast::parse_simple_eq;
 
     #[test]
-    fn test_node_context() {
-        let mut ctx = NodeContext::new();
-        ctx.set("x", 3.0);
-        assert!((ctx.get("x") - 3.0).abs() < 1e-9);
-        assert!(ctx.is_defined("x"));
-        assert!(!ctx.is_defined("y"));
+    fn test_eval_solver_number() {
+        let node = Node {
+            id: 0,
+            formula: Expr::Number(42.0),
+            state: NodeState::Gray,
+            value: None,
+            solve_target: None,
+        };
+        let solver = EvalSolver::new();
+        assert!(solver.supports(&node));
+
+        let ctx = HashMap::new();
+        let result = solver.solve(&node, &ctx);
+        match result {
+            SolveResult::Converged(map) => {
+                assert!((map.get("output").unwrap() - 42.0).abs() < 1e-9);
+            }
+            _ => panic!("期望 Converged"),
+        }
     }
 
     #[test]
-    fn test_auto_select_targets() {
-        let expr = parse_simple_eq("a + b = 10").unwrap();
-        let mut ctx = NodeContext::new();
-        ctx.set("a", 5.0);
+    fn test_eval_solver_expression() {
+        let expr = crate::ast::parse_expression("a + b").unwrap();
+        let node = Node {
+            id: 0,
+            formula: expr,
+            state: NodeState::Gray,
+            value: None,
+            solve_target: None,
+        };
+        let solver = EvalSolver::new();
+        let mut ctx = HashMap::new();
+        ctx.insert("a".to_string(), 3.0);
+        ctx.insert("b".to_string(), 7.0);
 
-        let targets = auto_select_solve_targets(&expr, &ctx);
-        assert_eq!(targets, vec!["b".to_string()]);
+        let result = solver.solve(&node, &ctx);
+        match result {
+            SolveResult::Converged(map) => {
+                assert!((map.get("output").unwrap() - 10.0).abs() < 1e-9);
+            }
+            _ => panic!("期望 Converged"),
+        }
     }
 
     #[test]
-    fn test_std_newton_solver() {
-        use crate::graph::NebulaGraph;
+    fn test_newton_solver_solve_eq() {
+        // a + 3 = 10 → 代数求解 a = 7
+        let expr = parse_simple_eq("a + 3 = 10").unwrap();
+        let node = Node {
+            id: 0,
+            formula: expr,
+            state: NodeState::Gray,
+            value: None,
+            solve_target: Some("a".to_string()),
+        };
+        let solver = NewtonSolver::new();
+        assert!(solver.supports(&node));
 
-        let mut graph = NebulaGraph::new();
-        let eq = parse_simple_eq("x * x = 4").unwrap();
-        let node_id = graph.add_node(eq);
+        let ctx = HashMap::new();
+        let result = solver.solve(&node, &ctx);
+        match result {
+            SolveResult::Converged(map) => {
+                let val = map.get("a").unwrap();
+                assert!((val - 7.0).abs() < 1e-9, "期望 a=7, 得到 {}", val);
+            }
+            _ => panic!("代数求解应 Converged, 结果: {:?}", result),
+        }
+    }
 
-        let mut ctx = NodeContext::new();
-        let mut solver = StdNewtonSolver::new();
+    #[test]
+    fn test_newton_solve_step_function() {
+        // 直接测试 newton_solve_step
+        let expr = parse_simple_eq("x * x = 4").unwrap();
+        let node = Node {
+            id: 0,
+            formula: expr,
+            state: NodeState::Gray,
+            value: None,
+            solve_target: Some("x".to_string()),
+        };
+        let ctx = HashMap::new();
+        let mut state = SolverState::new(3.0);
 
-        // 迭代直到收敛 (初值 0 是 x^2=4 的驻点，先设成 3.0)
-        graph.nodes[node_id].solver_state = crate::state::SolverState::new(3.0);
         for _ in 0..20 {
-            let node = &mut graph.nodes[node_id];
-            if solver.solve_step(node, &ctx, 0.01) {
-                break;
+            let result = newton_solve_step(&node, &ctx, &mut state);
+            match result {
+                SolveResult::Converged(map) => {
+                    let val = map.get("x").unwrap();
+                    assert!((val - 2.0).abs() < 1e-5, "期望 x≈2, 得到 {}", val);
+                    return;
+                }
+                _ => {}
             }
         }
-
-        let val = graph.nodes[node_id].value.unwrap();
-        assert!((val - 2.0).abs() < 0.01, "期望 ≈2, 得到 {}", val);
+        panic!("Newton 未收敛");
     }
 }

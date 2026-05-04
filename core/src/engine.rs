@@ -1,44 +1,57 @@
 /// 逻辑时钟调度器
 ///
 /// 使用 Compute/Commit 双缓冲模式：
-/// - Compute 阶段：所有节点从入边的 delay_buffer 只读输入，计算输出
+/// - Compute 阶段：从 delay_buffer 只读输入，通过 SolverManager 求解
 /// - Commit 阶段：将计算结果写入 delay_buffer（锁存供下一 Tick 读取）
 ///
-/// 自环（反馈环路）天然成立：Compute 读旧值，Commit 写新值。
-///
-/// Eq 节点处理策略：
-///   优先代数求解（solve_eq），失败则降级为 Newton 数值迭代（solver_step）。
-///   每 Tick 一步，跨 Tick 收敛。快机器收敛快，慢机器收敛慢，结果一致。
+/// 内核只负责调度，不负责"怎么解方程"。
+/// 所有求解能力通过 Solver trait 注入。
 
 use std::collections::HashMap;
 
-use crate::ast::Expr;
 use crate::graph::NebulaGraph;
-use crate::solver::{solve_eq, solve_or_iterate};
+use crate::solver_trait::SolverManager;
 use crate::state::NodeState;
 
 pub struct Scheduler {
     pub graph: NebulaGraph,
     /// 全局环境：(node_id, symbol) -> value
-    /// 存储每个节点最后的输出值，供外部查询
     pub env: HashMap<(usize, String), f64>,
     pub tick: usize,
+    /// 求解器管理器
+    pub solver_mgr: SolverManager,
 }
 
 impl Scheduler {
+    /// 使用默认求解器创建调度器
     pub fn new(graph: NebulaGraph) -> Self {
+        let solver_mgr = SolverManager::new(vec![
+            Box::new(crate::solver_trait::EvalSolver::new()),
+            Box::new(crate::solver_trait::NewtonSolver::new()),
+        ]);
         Scheduler {
             graph,
             env: HashMap::new(),
             tick: 0,
+            solver_mgr,
+        }
+    }
+
+    /// 使用自定义求解器管理器创建调度器
+    pub fn with_solver(graph: NebulaGraph, solver_mgr: SolverManager) -> Self {
+        Scheduler {
+            graph,
+            env: HashMap::new(),
+            tick: 0,
+            solver_mgr,
         }
     }
 
     /// 执行一个 Tick
     ///
     /// 分两阶段：
-    /// 1. Compute — 从 delay_buffer 读取所有已知输入，计算输出
-    /// 2. Commit — 将计算结果锁存到 delay_buffer，更新节点状态
+    /// 1. Compute — 从 delay_buffer 读取所有已知输入，通过 SolverManager 求解
+    /// 2. Commit — 将结果锁存到 delay_buffer，更新节点状态
     pub fn step(&mut self) {
         // ============================================================
         // Phase 1: Compute
@@ -55,63 +68,24 @@ impl Scheduler {
             };
 
             let known = self.graph.get_inputs_for_node(node_id);
-            let formula = self.graph.nodes[node_idx].formula.clone();
+            let node = &self.graph.nodes[node_idx];
 
-            match &formula {
-                Expr::Eq(_, _) => {
-                    // 优先代数求解
-                    match solve_eq(&formula, &known) {
-                        Ok(result) => {
-                            if !result.symbol.is_empty() {
-                                next_buffers.insert((node_id, result.symbol.clone()), result.value);
-                                next_buffers.insert((node_id, "output".to_string()), result.value);
-                            }
-                            state_changes.push((node_id, result.state));
-                        }
-                        Err(_) => {
-                            // 代数失败，尝试 Newton 数值迭代
-                            let solve_target = self.graph.nodes[node_idx]
-                                .solve_target
-                                .clone()
-                                .unwrap_or_default();
+            // 通过 SolverManager 求解
+            let result = self.solver_mgr.solve_node(node, &known);
 
-                            if solve_target.is_empty() {
-                                state_changes.push((node_id, NodeState::Purple));
-                            } else {
-                                let solver = &mut self.graph.nodes[node_idx].solver_state;
-                                let (val, state, _still_going) =
-                                    solve_or_iterate(&formula, &known, solver, &solve_target);
-
-                                // 检测奇异：如果 value 不是有限值或 residual 发散
-                                let final_state = if !val.is_finite() || val.abs() > 1e15 {
-                                    NodeState::Purple
-                                } else {
-                                    state
-                                };
-
-                                next_buffers.insert((node_id, solve_target.clone()), val);
-                                next_buffers.insert((node_id, "output".to_string()), val);
-                                state_changes.push((node_id, final_state));
-                            }
-                        }
-                    }
-                }
-                Expr::Number(n) => {
-                    next_buffers.insert((node_id, "output".to_string()), *n);
-                    state_changes.push((node_id, NodeState::Green));
-                }
-                _ => {
-                    match formula.eval(&known) {
-                        Ok(val) => {
-                            next_buffers.insert((node_id, "output".to_string()), val);
-                            state_changes.push((node_id, NodeState::Green));
-                        }
-                        Err(_) => {
-                            state_changes.push((node_id, NodeState::Purple));
-                        }
-                    }
-                }
+            // 将结果写入 next_buffers
+            let values = result.values();
+            for (sym, val) in &values {
+                next_buffers.insert((node_id, sym.clone()), *val);
             }
+            // 确保 output 存在
+            if !values.contains_key("output") && !values.is_empty() {
+                let first_val = values.values().next().unwrap();
+                next_buffers.insert((node_id, "output".to_string()), *first_val);
+            }
+
+            let node_state = result.node_state();
+            state_changes.push((node_id, node_state));
         }
 
         // ============================================================
@@ -163,7 +137,7 @@ impl Scheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::parse_simple_eq;
+    use crate::ast::{parse_simple_eq, Expr};
     use crate::graph::NebulaGraph;
 
     #[test]

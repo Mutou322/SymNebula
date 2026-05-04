@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 
 use crate::ast::Expr;
-use crate::state::{NodeState, SolverState};
+use crate::state::NodeState;
 
 // ============================================================
 // 神经元节点
@@ -21,8 +21,6 @@ pub struct Node {
     pub state: NodeState,
     /// 当前数值（如果是推导出的值）
     pub value: Option<f64>,
-    /// Newton 迭代状态（仅 Eq 节点使用）
-    pub solver_state: SolverState,
     /// 求解目标变量名（如 "x"），由 engine 自动推断或用户指定
     pub solve_target: Option<String>,
 }
@@ -81,7 +79,6 @@ impl NebulaGraph {
             formula,
             state: NodeState::Gray,
             value: None,
-            solver_state: SolverState::new(0.0),
             solve_target,
         });
         self.next_id += 1;
