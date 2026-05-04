@@ -19,3 +19,4 @@ pub mod solver_trait;
 pub mod integrators;
 pub mod guard;
 pub mod solvers;
+pub mod cluster;
