@@ -6,4 +6,4 @@ description = "NebulaMind — Pure mathematical formula deduction engine (no ext
 
 [dependencies]
 symnebula-macros = { path = "../macros" }
-# Zero external dependencies — pure stdlib
+zip = { version = "2", default-features = false, features = ["deflate"] }

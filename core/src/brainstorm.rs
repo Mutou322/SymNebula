@@ -524,6 +524,176 @@ impl fmt::Display for Expr {
 // 测试
 // ============================================================
 
+
+
+// ============================================================
+// BrainstormFile — .brainstorm zip 打包/解包
+// ============================================================
+
+use std::io::{Read, Seek, Write};
+
+impl GraphXml {
+    pub fn parse(xml: &str) -> Result<Self, String> {
+        let mut nodes = Vec::new();
+        let mut edges = Vec::new();
+        let mut in_node = false;
+        let mut cid = String::new();
+        let mut ctype = String::new();
+        let mut cexpr = String::new();
+        let mut cdyn = false;
+
+        for line in xml.lines() {
+            let t = line.trim();
+            if t.starts_with("<node ") {
+                in_node = true;
+                cid.clear(); ctype.clear(); cexpr.clear(); cdyn = false;
+                // extract id="..."
+                if let Some(s) = t.find("id=") {
+                    let after = &t[s+4..];
+                    if let Some(e) = after.find('"') {
+                        cid = after[..e].to_string();
+                    }
+                }
+                // extract type="..."
+                if let Some(s) = t.find("type=") {
+                    let after = &t[s+6..];
+                    if let Some(e) = after.find('"') {
+                        let raw = &after[..e];
+                        ctype = raw.split(' ').next().unwrap_or("").to_string();
+                    }
+                }
+                cdyn = t.contains("dynamic=true");
+            } else if in_node && t.starts_with("<expr>") {
+                if let Some(e) = t.find("</expr>") {
+                    cexpr = t[6..e].to_string();
+                }
+            } else if in_node && t.starts_with("</node>") {
+                in_node = false;
+                nodes.push(GraphNode {
+                    id: cid.clone(), node_type: ctype.clone(),
+                    expr: cexpr.clone(), is_dynamic: cdyn,
+                });
+            } else if t.starts_with("<edge ") {
+                let from = t.split("from=").nth(1)
+                    .and_then(|s| s.split('"').nth(1))
+                    .unwrap_or("").to_string();
+                let to = t.split("to=").nth(1)
+                    .and_then(|s| s.split('"').nth(1))
+                    .unwrap_or("").to_string();
+                if !from.is_empty() && !to.is_empty() {
+                    edges.push(GraphEdge { from, to });
+                }
+            }
+        }
+        Ok(GraphXml { nodes, edges })
+    }
+}
+
+fn json_extract_string(json: &str, key: &str) -> Option<String> {
+    let pat = format!("\"{}\": \"", key);
+    let s = json.find(&pat)?;
+    let r = &json[s + pat.len()..];
+    let mut out = String::new();
+    for c in r.chars() {
+        if c == '\\' { continue; }
+        if c == '"' { break; }
+        out.push(c);
+    }
+    Some(out)
+}
+
+fn json_extract_number(json: &str, key: &str) -> Option<f64> {
+    // Find "key": then parse number
+    let needle = format!("\"{}\": ", key);
+    let s = json.find(&needle)?;
+    let r = &json[s + needle.len()..];
+    let num: String = r.chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '.' || *c == '-' || *c == '+' || *c == 'e' || *c == 'E')
+        .collect();
+    num.parse().ok()
+}
+
+impl StateJson {
+    pub fn parse(json: &str) -> Result<Self, String> {
+        Ok(StateJson { tick: json_extract_number(json, "tick").unwrap_or(0.0) as u64, variables: HashMap::new(), node_state: HashMap::new(), x_cluster_cache: HashMap::new() })
+    }
+}
+
+impl ClustersJson {
+    pub fn parse(json: &str) -> Result<Self, String> {
+        Ok(ClustersJson { topology_version: json_extract_number(json, "topology_version").unwrap_or(0.0) as u64, clusters: Vec::new() })
+    }
+}
+
+impl RuntimeMetaJson {
+    pub fn parse(json: &str) -> Result<Self, String> {
+        Ok(RuntimeMetaJson {
+            tick_step: json_extract_number(json, "tick_step").unwrap_or(1.0) as u64,
+            solver: json_extract_string(json, "solver").unwrap_or_else(|| "newton_block".into()),
+            tolerance: json_extract_number(json, "tolerance").unwrap_or(1e-6),
+            max_iter: json_extract_number(json, "max_iter").unwrap_or(20.0) as u64,
+            rollback_policy: json_extract_string(json, "rollback_policy").unwrap_or_else(|| "cluster_atomic".into()),
+            color_rules: HashMap::new(),
+        })
+    }
+}
+
+impl VersionTxt {
+    pub fn parse(txt: &str) -> Result<Self, String> {
+        let mut bv = 0u64; let mut sc = String::new(); let mut tv = 0u64;
+        for line in txt.lines() {
+            let t = line.trim();
+            if let Some(v) = t.strip_prefix("brainstorm_version=") { bv = v.parse().unwrap_or(0); }
+            else if let Some(v) = t.strip_prefix("symnebula_core=") { sc = v.to_string(); }
+            else if let Some(v) = t.strip_prefix("topology_version=") { tv = v.parse().unwrap_or(0); }
+        }
+        Ok(VersionTxt { brainstorm_version: bv, symnebula_core: sc, topology_version: tv })
+    }
+}
+
+/// .brainstorm zip 文件读写器
+pub struct BrainstormFile;
+
+impl BrainstormFile {
+    pub fn write_to<W: Write + Seek>(bsi: &Brainstorm, writer: W) -> Result<(), String> {
+        let pkg = bsi.to_package();
+        let mut zipw = zip::ZipWriter::new(writer);
+        let files = ["version.txt", "graph.xml", "state.json", "clusters.json", "runtime.meta.json"];
+        for name in &files {
+            let content = pkg.get(*name).ok_or_else(|| format!("missing: {}", name))?;
+            let opts: zip::write::FileOptions<()> = zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+            zipw.start_file(*name, opts).map_err(|e| format!("zip start: {}", e))?;
+            zipw.write_all(content.as_bytes()).map_err(|e| format!("zip write: {}", e))?;
+        }
+        zipw.finish().map_err(|e| format!("zip finish: {}", e))?;
+        Ok(())
+    }
+
+    pub fn read_from<R: Read + Seek>(reader: R) -> Result<Brainstorm, String> {
+        let mut arch = zip::ZipArchive::new(reader).map_err(|e| format!("zip open: {}", e))?;
+        let mut gx = String::new(); let mut sj = String::new(); let mut cj = String::new();
+        let mut mj = String::new(); let mut vt = String::new();
+        for i in 0..arch.len() {
+            let mut file = arch.by_index(i).map_err(|e| format!("entry {}: {}", i, e))?;
+            let name = file.name().to_string();
+            let mut c = String::new();
+            file.read_to_string(&mut c).map_err(|e| format!("read {}: {}", name, e))?;
+            match name.as_str() {
+                "graph.xml" => gx = c, "state.json" => sj = c,
+                "clusters.json" => cj = c, "runtime.meta.json" => mj = c,
+                "version.txt" => vt = c,
+                _ if name.starts_with("snapshots/") => {},
+                _ => return Err(format!("unknown file: {}", name)),
+            }
+        }
+        Ok(Brainstorm {
+            graph: GraphXml::parse(&gx)?, state: StateJson::parse(&sj)?,
+            clusters: ClustersJson::parse(&cj)?, meta: RuntimeMetaJson::parse(&mj)?,
+            snapshots: Vec::new(), version: VersionTxt::parse(&vt)?,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
