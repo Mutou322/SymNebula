@@ -17,6 +17,7 @@ use crate::ast::Expr;
 use crate::graph::NebulaGraph;
 use crate::guard::num::ensure_finite;
 use crate::solver::Matrix;
+use crate::state::NodeState;
 
 // ============================================================
 // 第 0 层：Union-Find 数据结构
@@ -374,6 +375,108 @@ impl SccPartitioner {
 }
 
 // ============================================================
+// 新的第 0.5 层：Cluster Detection — 双关系传递闭包
+// ============================================================
+
+/// Cluster = 通过"突触(synapse) + 约束引用"可达的节点闭包
+pub struct ClusterDetector;
+
+impl ClusterDetector {
+    /// 双关系 BFS：从每个未访问节点出发，沿 synapse 边和约束引用边扩散
+    ///
+    /// 约束引用边 = node A 的公式中引用了 node B 的变量符号（通过 synapse 连通）
+    ///
+    /// 返回 Vec<Vec<usize>>，每个子 vec 是一个 cluster 内的 node_id 列表
+    pub fn detect(graph: &NebulaGraph) -> Vec<Vec<usize>> {
+        let n = graph.nodes.len();
+        if n == 0 {
+            return Vec::new();
+        }
+
+        // 构建邻接表：两个节点之间有边当且仅当
+        // a) 存在 synapse 连通（任意方向）
+        // b) 共享变量引用（通过 synapse 路径间接连通也行）
+
+        // 先用 Union-Find 把 synapse 连通的节点合并
+        let mut node_uf: Vec<usize> = (0..n).collect();
+        fn find(parent: &mut [usize], x: usize) -> usize {
+            if parent[x] != x {
+                parent[x] = find(parent, parent[x]);
+            }
+            parent[x]
+        }
+        fn union(parent: &mut [usize], a: usize, b: usize) {
+            let ra = find(parent, a);
+            let rb = find(parent, b);
+            if ra != rb {
+                parent[ra] = rb;
+            }
+        }
+
+        //  synapse 边连接节点
+        for edge in &graph.edges {
+            let from = edge.from_node;
+            let to = edge.to_node;
+            if from < n && to < n && from != to {
+                union(&mut node_uf, from, to);
+            }
+        }
+
+        // 约束引用边：如果 node_i 的公式引用了一个符号 s，
+        // 且存在 synapse 将 node_j 的某个端口映射到该符号 s，
+        // 则 i 和 j 有约束引用关系
+        let mut node_adj: Vec<HashSet<usize>> = vec![HashSet::new(); n];
+        for edge in &graph.edges {
+            if edge.from_node < n && edge.to_node < n && edge.from_node != edge.to_node {
+                // 双向连接
+                node_adj[edge.from_node].insert(edge.to_node);
+                node_adj[edge.to_node].insert(edge.from_node);
+            }
+        }
+
+        // 约束引用：如果 node_i 的公式中有符号 s，
+        // 且 node_j 也有符号 s（通过任一 synapse 边），则 i 和 j 耦合
+        for i in 0..n {
+            let syms_i: HashSet<String> = graph.nodes[i].formula.symbols().into_iter().collect();
+            for j in (i + 1)..n {
+                // 已通过 synapse 连通则跳过
+                if find(&mut node_uf, i) == find(&mut node_uf, j) {
+                    continue;
+                }
+                let syms_j: HashSet<String> =
+                    graph.nodes[j].formula.symbols().into_iter().collect();
+                // 共享符号 → 约束引用边
+                if syms_i.intersection(&syms_j).next().is_some() {
+                    node_adj[i].insert(j);
+                    node_adj[j].insert(i);
+                    union(&mut node_uf, i, j);
+                }
+            }
+        }
+
+        // 最终路径压缩
+        for i in 0..n {
+            find(&mut node_uf, i);
+        }
+
+        // 收集每个 cluster 的节点列表
+        let mut root_to_cluster: HashMap<usize, Vec<usize>> = HashMap::new();
+        for i in 0..n {
+            root_to_cluster.entry(node_uf[i]).or_default().push(i);
+        }
+
+        // 按最小 node_id 排序
+        let mut clusters: Vec<Vec<usize>> = root_to_cluster.into_values().collect();
+        for c in &mut clusters {
+            c.sort();
+        }
+        clusters.sort_by(|a, b| a[0].cmp(&b[0]));
+
+        clusters
+    }
+}
+
+// ============================================================
 // 第 3 层：Block Newton Solver
 // ============================================================
 
@@ -472,154 +575,220 @@ impl BlockNewtonSolver {
 // 第 4 层：ClusterSolverV3 — Tick 四阶段流水线
 // ============================================================
 
-/// Tick 编译结果（冻结一次编译，多次求解）
-pub struct TickCompilation {
-    /// 编译后的约束列表
+/// 单个 cluster 的编译结果
+pub struct ClusterCompilation {
+    pub node_ids: Vec<usize>,
     pub constraints: Vec<CompiledConstraint>,
-    /// SCC block：每个 block 是 (constraint_indices_in_block, variable_indices_in_block)
     pub blocks: Vec<(Vec<usize>, Vec<usize>)>,
-    /// 全局变量数
-    pub n_global_vars: usize,
-    /// 变量端口到全局索引的映射
+    pub n_vars: usize,
     pub global_idx_map: HashMap<VarPort, usize>,
 }
 
+/// Tick 编译结果
+pub struct TickCompilation {
+    pub clusters: Vec<ClusterCompilation>,
+}
+
+/// 单次 tick 的求解结果
+#[derive(Debug, Clone)]
+pub struct ClusterTickResult {
+    /// 每个 cluster 的求解状态
+    pub cluster_states: Vec<Vec<(usize, NodeState)>>,
+    /// 平均残差
+    pub avg_residual: f64,
+}
+
 pub struct ClusterSolverV3 {
-    /// 全局变量向量
-    pub x: Vec<f64>,
-    /// 当前 Tick 的编译结果（一次编译，可能多次调用 iter_tick）
-    pub compilation: Option<TickCompilation>,
     pub newton: BlockNewtonSolver,
+    /// 每个 cluster 的变量向量（X_cluster 隔离）
+    pub cluster_xs: Vec<Vec<f64>>,
+    pub compilation: Option<TickCompilation>,
 }
 
 impl ClusterSolverV3 {
     pub fn new() -> Self {
         ClusterSolverV3 {
-            x: Vec::new(),
-            compilation: None,
             newton: BlockNewtonSolver::new(),
+            cluster_xs: Vec::new(),
+            compilation: None,
         }
     }
 
     // ======================================================
-    // Phase 1-2: Snapshot + Compilation（单次执行）
+    // Phase 1: Snapshot → Phase 2: Compile
     // ======================================================
 
-    /// 编译阶段：冻结 Graph → Union-Find → Dependency → SCC
-    ///
-    /// 执行一次，结果缓存在 self.compilation 中供多次 solve 使用
+    /// 编译阶段：Snapshot → Cluster Detection → for each Cluster: UF → Dep → SCC
     pub fn compile(&mut self, graph: &NebulaGraph) {
-        // Phase 2a: Union-Find 变量等价合并
-        let ports = VariableMerger::extract_ports(graph);
-        let (_port_to_idx, parent, _labels) = VariableMerger::compute_equivalence(&ports, graph);
-        let (global_idx_map, n_global_vars) = VariableMerger::build_global_index(&ports, &parent);
+        // Phase 1: Snapshot 由调用者保证（graph 是引用，不可变）
 
-        // 初始化全局变量向量
-        self.x = vec![0.0; n_global_vars];
+        // Phase 1.5: Cluster Detection
+        let raw_clusters = ClusterDetector::detect(graph);
 
-        // 从 synapse default_value 填充初始值
-        for edge in &graph.edges {
-            if let Some(d) = edge.default_value {
-                let port = VarPort::new(edge.from_node, &edge.from_symbol);
-                if let Some(&gidx) = global_idx_map.get(&port) {
-                    if self.x[gidx] == 0.0 {
-                        self.x[gidx] = d;
+        let mut cluster_comps: Vec<ClusterCompilation> = Vec::new();
+        self.cluster_xs = Vec::new();
+
+        for node_ids in &raw_clusters {
+            // 构建子图（只包含该 cluster 的节点和边）
+            let node_set: HashSet<usize> = node_ids.iter().copied().collect();
+            let sub_nodes: Vec<&crate::graph::Node> = graph.nodes.iter()
+                .filter(|n| node_set.contains(&n.id))
+                .collect();
+            let sub_edges: Vec<&crate::graph::Synapse> = graph.edges.iter()
+                .filter(|e| node_set.contains(&e.from_node) && node_set.contains(&e.to_node))
+                .collect();
+
+            // 用子图构建临时 NebulaGraph 供 UF 使用
+            // 但 UF 只需要 edges 和 nodes，直接从原 graph 过滤引用
+            // 简化：用原 graph + node_set 做 UF（只对该 cluster 内的 ports 和 edges）
+
+            // Phase 2a: Union-Find
+            let ports = VariableMerger::extract_ports_subset(graph, node_ids);
+            let (_port_to_idx, parent, _labels) = VariableMerger::compute_equivalence_subset(&ports, graph, node_ids);
+            let (global_idx_map, n_vars) = VariableMerger::build_global_index(&ports, &parent);
+
+            // 初始化 X_cluster
+            let mut x_cluster = vec![0.0; n_vars];
+            for edge in &graph.edges {
+                if node_set.contains(&edge.from_node) && node_set.contains(&edge.to_node) {
+                    if let Some(d) = edge.default_value {
+                        let port = VarPort::new(edge.from_node, &edge.from_symbol);
+                        if let Some(&gidx) = global_idx_map.get(&port) {
+                            if x_cluster[gidx] == 0.0 {
+                                x_cluster[gidx] = d;
+                            }
+                        }
                     }
                 }
             }
-        }
+            self.cluster_xs.push(x_cluster);
 
-        // Phase 2b: Dependency 构建
-        let (constraints, dg) = build_dependency_system(graph, &global_idx_map, n_global_vars);
+            // Phase 2b: Dependency 构建（只对该 cluster 内的节点）
+            let (constraints, dg) = build_dependency_system_subset(graph, &global_idx_map, n_vars, node_ids);
 
-        // Phase 2c: SCC 分块
-        let raw_sccs = SccPartitioner::partition(&constraints, &dg);
-
-        // 将 raw SCC 映射为 (constraint_indices, variable_indices) 格式
-        let n_cons = constraints.len();
-        let mut blocks: Vec<(Vec<usize>, Vec<usize>)> = Vec::new();
-
-        for scc in &raw_sccs {
-            let mut cons_in_block: Vec<usize> = scc
-                .iter()
-                .filter(|&&node| node < n_cons)
-                .copied()
-                .collect();
-            if cons_in_block.is_empty() {
+            if constraints.is_empty() {
+                // 无约束的 cluster（纯赋值或常量节点）跳过
                 continue;
             }
-            cons_in_block.sort();
-            cons_in_block.dedup();
 
-            // 收集该 block 涉及的全局变量
-            let mut vars_in_block: HashSet<usize> = HashSet::new();
-            for &cid in &cons_in_block {
-                for &vid in &dg.constraint_to_vars[cid] {
-                    vars_in_block.insert(vid);
+            // Phase 2c: SCC 分块
+            let raw_sccs = SccPartitioner::partition(&constraints, &dg);
+
+            let n_cons = constraints.len();
+            let mut blocks: Vec<(Vec<usize>, Vec<usize>)> = Vec::new();
+
+            for scc in &raw_sccs {
+                let mut cons_in_block: Vec<usize> = scc
+                    .iter()
+                    .filter(|&&node| node < n_cons)
+                    .copied()
+                    .collect();
+                if cons_in_block.is_empty() {
+                    continue;
                 }
-            }
-            let mut var_list: Vec<usize> = vars_in_block.into_iter().collect();
-            var_list.sort();
+                cons_in_block.sort();
+                cons_in_block.dedup();
 
-            blocks.push((cons_in_block, var_list));
+                let mut vars_in_block: HashSet<usize> = HashSet::new();
+                for &cid in &cons_in_block {
+                    for &vid in &dg.constraint_to_vars[cid] {
+                        vars_in_block.insert(vid);
+                    }
+                }
+                let mut var_list: Vec<usize> = vars_in_block.into_iter().collect();
+                var_list.sort();
+
+                blocks.push((cons_in_block, var_list));
+            }
+
+            cluster_comps.push(ClusterCompilation {
+                node_ids: node_ids.clone(),
+                constraints,
+                blocks,
+                n_vars,
+                global_idx_map,
+            });
         }
 
         self.compilation = Some(TickCompilation {
-            constraints,
-            blocks,
-            n_global_vars,
-            global_idx_map,
+            clusters: cluster_comps,
         });
     }
 
     // ======================================================
-    // Phase 3: Solve（可多次迭代）
+    // Phase 3: Solve — 每个 cluster 独立 tick
     // ======================================================
 
-    pub fn tick(&mut self) -> f64 {
+    /// 执行一次所有 cluster 的 Block Newton 迭代
+    ///
+    /// 返回每个 cluster 的节点状态和平均残差
+    pub fn tick(&mut self) -> ClusterTickResult {
         let comp = match &self.compilation {
             Some(c) => c,
-            None => return f64::INFINITY,
+            None => return ClusterTickResult {
+                cluster_states: Vec::new(),
+                avg_residual: f64::INFINITY,
+            },
         };
 
+        let mut all_states: Vec<Vec<(usize, NodeState)>> = Vec::new();
         let mut total_res = 0.0;
         let mut total_cons = 0;
 
-        for (_block_idx, (cons_indices, var_indices)) in comp.blocks.iter().enumerate() {
-            let block_cons: Vec<&CompiledConstraint> = cons_indices
-                .iter()
-                .map(|&cid| &comp.constraints[cid])
-                .collect();
+        for (ci, cluster_comp) in comp.clusters.iter().enumerate() {
+            let mut cluster_states: Vec<(usize, NodeState)> = Vec::new();
+            let x_cluster = &mut self.cluster_xs[ci];
+            let mut cluster_has_singular = false;
+            let mut cluster_has_unconverged = false;
 
-            match self
-                .newton
-                .step_block(&block_cons, var_indices, &mut self.x)
-            {
-                Ok(converged) => {
-                    for &cid in cons_indices {
-                        let res = (comp.constraints[cid].func)(&self.x).abs();
-                        total_res += res;
-                        total_cons += 1;
+            for (_block_idx, (cons_indices, var_indices)) in cluster_comp.blocks.iter().enumerate() {
+                let block_cons: Vec<&CompiledConstraint> = cons_indices
+                    .iter()
+                    .map(|&cid| &cluster_comp.constraints[cid])
+                    .collect();
+
+                match self.newton.step_block(&block_cons, var_indices, x_cluster) {
+                    Ok(converged) => {
+                        for &cid in cons_indices {
+                            let res = (cluster_comp.constraints[cid].func)(x_cluster).abs();
+                            total_res += res;
+                            total_cons += 1;
+                        }
+                        if !converged {
+                            cluster_has_unconverged = true;
+                        }
                     }
-                    if !converged && total_cons > 0 && total_res / total_cons as f64 > 0.1 {
-                        // 未收敛且残差大时输出
-                    }
-                }
-                Err(_e) => {
-                    // 奇异块：残差累加但标记
-                    for &cid in cons_indices {
-                        let res = (comp.constraints[cid].func)(&self.x).abs();
-                        total_res += res;
-                        total_cons += 1;
+                    Err(_) => {
+                        cluster_has_singular = true;
+                        for &cid in cons_indices {
+                            let res = (cluster_comp.constraints[cid].func)(x_cluster).abs();
+                            total_res += res;
+                            total_cons += 1;
+                        }
                     }
                 }
             }
+
+            // 决定 cluster 内各节点的颜色
+            let node_color = if cluster_has_singular {
+                NodeState::Purple
+            } else if cluster_has_unconverged {
+                NodeState::Yellow
+            } else if cluster_comp.blocks.is_empty() {
+                NodeState::Gray
+            } else {
+                NodeState::Green
+            };
+
+            for &nid in &cluster_comp.node_ids {
+                cluster_states.push((nid, node_color.clone()));
+            }
+            all_states.push(cluster_states);
         }
 
-        if total_cons > 0 {
-            total_res / total_cons as f64
-        } else {
-            0.0
+        ClusterTickResult {
+            cluster_states: all_states,
+            avg_residual: if total_cons > 0 { total_res / total_cons as f64 } else { 0.0 },
         }
     }
 
@@ -627,19 +796,133 @@ impl ClusterSolverV3 {
     // Phase 4: Commit（查询接口）
     // ======================================================
 
-    /// 获取全局变量值
     pub fn get_value(&self, node_id: usize, symbol: &str) -> Option<f64> {
+        let comp = self.compilation.as_ref()?;
         let port = VarPort::new(node_id, symbol);
-        match &self.compilation {
-            Some(comp) => comp.global_idx_map.get(&port).map(|&idx| self.x[idx]),
-            None => None,
+        for (ci, cluster_comp) in comp.clusters.iter().enumerate() {
+            if let Some(&gidx) = cluster_comp.global_idx_map.get(&port) {
+                return Some(self.cluster_xs[ci][gidx]);
+            }
+        }
+        None
+    }
+}
+
+// ============================================================
+// 辅助：subset 版本的 extract_ports / compute_equivalence / build_dependency_system
+// ============================================================
+
+impl VariableMerger {
+    /// 只提取指定 node_ids 中的变量端口
+    pub fn extract_ports_subset(graph: &NebulaGraph, node_ids: &[usize]) -> Vec<VarPort> {
+        let node_set: HashSet<usize> = node_ids.iter().copied().collect();
+        let mut ports_set: HashSet<VarPort> = HashSet::new();
+        for node in &graph.nodes {
+            if node_set.contains(&node.id) {
+                for sym in node.formula.symbols() {
+                    ports_set.insert(VarPort::new(node.id, &sym));
+                }
+            }
+        }
+        let mut ports: Vec<VarPort> = ports_set.into_iter().collect();
+        ports.sort_by(|a, b| a.node_id.cmp(&b.node_id).then(a.symbol.cmp(&b.symbol)));
+        ports
+    }
+
+    /// 只在 cluster 内执行 Union-Find
+    pub fn compute_equivalence_subset(
+        ports: &[VarPort],
+        graph: &NebulaGraph,
+        node_ids: &[usize],
+    ) -> (HashMap<VarPort, usize>, Vec<usize>, HashMap<usize, String>) {
+        let node_set: HashSet<usize> = node_ids.iter().copied().collect();
+        let n = ports.len();
+        let mut port_to_idx: HashMap<VarPort, usize> = HashMap::new();
+        for (i, p) in ports.iter().enumerate() {
+            port_to_idx.insert(p.clone(), i);
+        }
+
+        let mut parent: Vec<usize> = (0..n).collect();
+
+        fn find(parent: &mut [usize], x: usize) -> usize {
+            if parent[x] != x {
+                parent[x] = find(parent, parent[x]);
+            }
+            parent[x]
+        }
+        fn union(parent: &mut [usize], a: usize, b: usize) {
+            let ra = find(parent, a);
+            let rb = find(parent, b);
+            if ra != rb {
+                parent[ra] = rb;
+            }
+        }
+
+        for edge in &graph.edges {
+            if node_set.contains(&edge.from_node) && node_set.contains(&edge.to_node) {
+                let from_port = VarPort::new(edge.from_node, &edge.from_symbol);
+                let to_port = VarPort::new(edge.to_node, &edge.to_symbol);
+                if let (Some(&fi), Some(&ti)) = (port_to_idx.get(&from_port), port_to_idx.get(&to_port)) {
+                    union(&mut parent, fi, ti);
+                }
+            }
+        }
+
+        for i in 0..n {
+            find(&mut parent, i);
+        }
+
+        let mut root_to_label: HashMap<usize, String> = HashMap::new();
+        for p in ports {
+            let idx = port_to_idx[p];
+            let root = parent[idx];
+            root_to_label.entry(root).or_insert_with(|| p.symbol.clone());
+        }
+
+        (port_to_idx, parent, root_to_label)
+    }
+}
+
+/// 只对 cluster 内节点构建依赖系统
+pub fn build_dependency_system_subset(
+    graph: &NebulaGraph,
+    global_idx_map: &HashMap<VarPort, usize>,
+    n_global_vars: usize,
+    node_ids: &[usize],
+) -> (Vec<CompiledConstraint>, DependencyGraph) {
+    let node_set: HashSet<usize> = node_ids.iter().copied().collect();
+    let mut constraints: Vec<CompiledConstraint> = Vec::new();
+
+    for node in &graph.nodes {
+        if node_set.contains(&node.id) {
+            if let Some(cons) = compile_constraint(node.id, &node.formula, global_idx_map) {
+                constraints.push(cons);
+            }
         }
     }
 
-    /// 重置求解状态
-    pub fn reset(&mut self, graph: &NebulaGraph) {
-        self.compile(graph);
+    let n_constraints = constraints.len();
+    let mut c_to_v: Vec<Vec<usize>> = Vec::with_capacity(n_constraints);
+    let mut v_to_c: Vec<Vec<usize>> = vec![Vec::new(); n_global_vars];
+
+    for (cid, cons) in constraints.iter().enumerate() {
+        let mut uniq: Vec<usize> = cons.var_indices.clone();
+        uniq.sort();
+        uniq.dedup();
+        c_to_v.push(uniq.clone());
+        for &vid in &uniq {
+            if vid < n_global_vars {
+                v_to_c[vid].push(cid);
+            }
+        }
     }
+
+    let dg = DependencyGraph {
+        constraint_to_vars: c_to_v,
+        var_to_constraints: v_to_c,
+    };
+
+    (constraints, dg)
 }
 
 // ============================================================
@@ -662,7 +945,7 @@ mod tests {
         let mut solver = ClusterSolverV3::new();
         solver.compile(&g);
         let comp = solver.compilation.as_ref().unwrap();
-        assert!(comp.blocks.len() >= 1);
+        assert!(comp.clusters[0].blocks.len() >= 1);
     }
 
     /// Union-Find 语义：同名但无 synapse → 不同变量
@@ -741,8 +1024,8 @@ mod tests {
 
         // 多次 tick 直到收敛
         for _ in 0..30 {
-            let residual = solver.tick();
-            if residual < 1e-8 {
+            let result = solver.tick();
+            if result.avg_residual < 1e-8 {
                 break;
             }
         }
@@ -768,8 +1051,8 @@ mod tests {
         solver.compile(&g);
 
         for _ in 0..30 {
-            let residual = solver.tick();
-            if residual < 1e-8 {
+            let result = solver.tick();
+            if result.avg_residual < 1e-8 {
                 break;
             }
         }
@@ -802,8 +1085,8 @@ mod tests {
         solver.compile(&g);
 
         for _ in 0..50 {
-            let residual = solver.tick();
-            if residual < 1e-8 {
+            let result = solver.tick();
+            if result.avg_residual < 1e-8 {
                 break;
             }
         }
@@ -845,7 +1128,7 @@ mod tests {
         solver.compile(&g);
 
         // tick 不应 panic
-        let residual = solver.tick();
-        assert!(residual.is_finite());
+        let result = solver.tick();
+        assert!(result.avg_residual.is_finite());
     }
 }
