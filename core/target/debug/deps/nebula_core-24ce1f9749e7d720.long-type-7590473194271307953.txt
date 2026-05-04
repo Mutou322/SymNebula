@@ -1,0 +1,1 @@
+(fn(_) -> Result<(_, _), nom::Err<_>> {nom::character::complete::digit1::<_, _>}, impl FnMut(_) -> Result<(_, (_, (char, _))), nom::Err<_>>)

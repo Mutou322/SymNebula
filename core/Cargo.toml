@@ -2,9 +2,7 @@
 name = "nebula-core"
 version = "0.1.0"
 edition = "2021"
-description = "NebulaMind — Pure mathematical formula deduction and model dynamics engine"
+description = "NebulaMind — Pure mathematical formula deduction engine (no external deps)"
 
 [dependencies]
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-rayon = "1"
+# Zero external dependencies — pure stdlib
