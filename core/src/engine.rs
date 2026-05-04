@@ -25,10 +25,7 @@ pub struct Scheduler {
 impl Scheduler {
     /// 使用默认求解器创建调度器
     pub fn new(graph: NebulaGraph) -> Self {
-        let solver_mgr = SolverManager::new(vec![
-            Box::new(crate::solver_trait::EvalSolver::new()),
-            Box::new(crate::solver_trait::NewtonSolver::new()),
-        ]);
+        let solver_mgr = crate::solver_trait::default_solver_manager();
         Scheduler {
             graph,
             env: HashMap::new(),
