@@ -15,6 +15,7 @@ use sym_nebula_core::ast::{parse_expression, parse_simple_eq, Expr};
 use sym_nebula_core::engine::Scheduler;
 use sym_nebula_core::graph::NebulaGraph;
 use sym_nebula_core::state::NodeState;
+use sym_nebula_core::viz::TickDisplay;
 
 fn main() {
     println!("{}", "=".repeat(65));
@@ -80,6 +81,7 @@ fn main() {
     graph.add_edge_with_default(x_node, "output", a_node, "x", 10.0);
 
     let mut scheduler = Scheduler::new(graph);
+    let mut viz = TickDisplay::new();
 
     // ============================================================
     // 执行 Tick 循环
@@ -91,9 +93,14 @@ fn main() {
 
     let num_ticks = 200;
     let print_interval = 20;
+    let viz_interval = 10;
 
     for _ in 1..=num_ticks {
         scheduler.step();
+
+        if scheduler.tick % viz_interval == 0 {
+            viz.record(&scheduler);
+        }
 
         let t = scheduler.tick;
         if t % print_interval == 0 {
@@ -125,10 +132,7 @@ fn main() {
     println!("  动能 Ek = {:.4}, 势能 Ep = {:.4}, 总能量 = {:.4}", ek, ep, ek + ep);
 
     println!();
-    println!("  节点状态:");
-    for node in &scheduler.graph.nodes {
-        println!("    Node {}: {:?} (value={:?})", node.id, node.state, node.value);
-    }
+    viz.render();
     println!();
     println!("{}", "=".repeat(65));
 }

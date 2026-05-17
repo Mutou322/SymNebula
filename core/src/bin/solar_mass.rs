@@ -18,7 +18,7 @@
 use sym_nebula_core::ast::{parse_expression, parse_simple_eq, Expr};
 use sym_nebula_core::engine::Scheduler;
 use sym_nebula_core::graph::NebulaGraph;
-use sym_nebula_core::state::NodeState;
+use sym_nebula_core::viz::TickDisplay;
 
 fn main() {
     // ============================================================
@@ -79,31 +79,27 @@ fn main() {
     graph.add_edge_with_default(v_node, "output", eq_node, "v", 0.0);
 
     // ============================================================
-    // 执行调度
+    // 执行调度（带可视化）
     // ============================================================
     let mut scheduler = Scheduler::new(graph);
+    let mut viz = TickDisplay::new();
     let expected_mass = 1.989e30; // 真实太阳质量 (kg)
 
     println!("  执行 Tick 计算...");
     println!();
-    println!("  {:>4}  {:>20}  {:>12}  {:>6}  {}", "Tick", "M (kg)", "v (m/s)", "状态", "误差");
-    println!("  {}  {}  {}  {}  {}", "-".repeat(4), "-".repeat(20), "-".repeat(12), "-".repeat(6), "-".repeat(8));
 
     for tick in 1..=3 {
         scheduler.step();
+        viz.record(&scheduler);
 
         // 读取引擎推导的值
         let m_val = scheduler.get_value(eq_node, "M").unwrap_or(0.0);
         let v_val = scheduler.get_value(v_node, "output").unwrap_or(0.0);
         let error = (m_val - expected_mass).abs() / expected_mass * 100.0;
 
-        // 检查所有节点是否正常
-        let all_green = scheduler.graph.nodes.iter().all(|n| n.state == NodeState::Green);
-        let status = if all_green { "G" } else { "?" };
-
         println!(
-            "  {:>4}  {:>20.6e}  {:>12.2}  {:>6}  {:.4}%",
-            tick, m_val, v_val, status, error
+            "  Tick {}  M = {: >20.6e}  v = {: >10.2} m/s  err = {:.4}%",
+            tick, m_val, v_val, error
         );
     }
 
@@ -130,12 +126,9 @@ fn main() {
         println!("  ❌ 结果偏差较大，请检查模型");
     }
 
-    // 打印节点状态
+    // 可视化表格
     println!();
-    println!("  节点状态:");
-    for node in &scheduler.graph.nodes {
-        println!("    Node {}: {:?} (formula: {})", node.id, node.state, node.formula);
-    }
+    viz.render();
     println!();
     println!("{}", "=".repeat(65));
 }
