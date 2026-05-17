@@ -13,4 +13,5 @@ egui = "0.28"
 egui-wgpu = "0.28"
 pollster = "0.3"
 bytemuck = { version = "1.15", features = ["derive"] }
+glam = { version = "0.25", features = ["bytemuck"] }
 rand = "0.8"

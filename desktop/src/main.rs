@@ -8,6 +8,7 @@
 //   滚轮      → 缩放         空格 → 切换自动 Tick
 //   左键单击  → 选中节点      Enter → 执行搜索
 
+use glam::{Mat4, Vec3, Vec4};
 use std::time::Instant;
 use wgpu::util::DeviceExt;
 use winit::{
@@ -36,6 +37,7 @@ struct Node {
     formula: String,
     inputs: Vec<usize>,
     highlighted: bool,
+    flash_timer: f32,
 }
 
 #[derive(Debug, Clone)]
@@ -61,7 +63,6 @@ struct ClusterCache {
     clusters: Vec<ClusterState>,
 }
 
-#[derive(Debug)]
 struct App {
     tick: u64,
     cache: ClusterCache,
@@ -70,6 +71,26 @@ struct App {
     auto_tick: bool,
     search_query: String,
     selected_id: Option<usize>,
+    next_node_id: usize,
+    command_buffer: String,
+    ai_bridge: AiBridge,
+}
+
+impl std::fmt::Debug for App {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("App")
+            .field("tick", &self.tick)
+            .field("cache", &self.cache)
+            .field("converged", &self.converged)
+            .field("just_committed", &self.just_committed)
+            .field("auto_tick", &self.auto_tick)
+            .field("search_query", &self.search_query)
+            .field("selected_id", &self.selected_id)
+            .field("next_node_id", &self.next_node_id)
+            .field("command_buffer", &self.command_buffer)
+            .field("ai_bridge", &self.ai_bridge)
+            .finish()
+    }
 }
 
 impl App {
@@ -112,6 +133,7 @@ impl App {
                     formula: formulas[j].to_string(),
                     inputs: Vec::new(),
                     highlighted: false,
+                    flash_timer: 0.0,
                 });
             }
 
@@ -144,6 +166,7 @@ impl App {
         }
 
         let n = clusters.len();
+        let next_node_id = next_id;
         Self {
             tick: 0,
             cache: ClusterCache { topology_version: 1, clusters },
@@ -152,10 +175,13 @@ impl App {
             auto_tick: true,
             search_query: String::new(),
             selected_id: None,
+            next_node_id,
+            command_buffer: String::new(),
+            ai_bridge: AiBridge::new(),
         }
     }
 
-    fn advance(&mut self) {
+    fn advance(&mut self, dt: f32) {
         self.tick += 1;
         for (i, cluster) in self.cache.clusters.iter_mut().enumerate() {
             let was_green = self.converged[i];
@@ -169,6 +195,18 @@ impl App {
                 self.converged[i] = false;
             }
         }
+
+        // Flash timer decay
+        for cluster in &mut self.cache.clusters {
+            for node in &mut cluster.nodes {
+                if node.flash_timer > 0.0 {
+                    node.flash_timer -= dt;
+                    if node.flash_timer <= 0.0 {
+                        node.highlighted = false;
+                    }
+                }
+            }
+        }
     }
 
     fn search_node(&mut self, query: &str) {
@@ -177,6 +215,9 @@ impl App {
             for node in &mut cluster.nodes {
                 node.highlighted = node.name.to_lowercase().contains(&q)
                     || node.id.to_string() == q;
+                if node.highlighted {
+                    node.flash_timer = 2.0;
+                }
             }
         }
     }
@@ -211,6 +252,119 @@ impl App {
     fn cluster_id_of(&self, node_id: usize) -> Option<usize> {
         self.cache.clusters.iter().find(|c| c.nodes.iter().any(|n| n.id == node_id)).map(|c| c.id)
     }
+
+    fn add_node(&mut self, name: &str, pos: [f32; 3]) {
+        let id = self.next_node_id;
+        self.next_node_id += 1;
+        let target_cid = self.selected_id
+            .and_then(|sid| self.cluster_id_of(sid))
+            .unwrap_or(3);
+        let cidx = self.cache.clusters.iter().position(|c| c.id == target_cid)
+            .unwrap_or(0);
+        let cluster = &mut self.cache.clusters[cidx];
+
+        cluster.nodes.push(Node {
+            id,
+            name: name.to_string(),
+            position: pos,
+            status: NodeStatus::Yellow,
+            x_value: 0.0,
+            formula: "avg".to_string(),
+            inputs: Vec::new(),
+            highlighted: false,
+            flash_timer: 0.0,
+        });
+        cluster.x_cluster.push(0.0);
+        cluster.temp_x.push(0.0);
+        self.cache.topology_version += 1;
+        println!("✦ Added node #{} '{}' to cluster {}", id, name, cluster.id);
+    }
+
+    fn add_synapse(&mut self, from: usize, to: usize) {
+        for cluster in &mut self.cache.clusters {
+            let has_from = cluster.nodes.iter().any(|n| n.id == from);
+            let has_to = cluster.nodes.iter().any(|n| n.id == to);
+            if has_from && has_to {
+                let weight = rand::thread_rng().gen_range(0.3..0.9);
+                cluster.synapses.push(Synapse { from, to, weight });
+                if let Some(node) = cluster.nodes.iter_mut().find(|n| n.id == to) {
+                    if !node.inputs.contains(&from) {
+                        node.inputs.push(from);
+                    }
+                }
+                self.cache.topology_version += 1;
+                println!("✦ Added synapse #{} → #{} weight={:.2}", from, to, weight);
+                return;
+            }
+        }
+        eprintln!("⚠ Cannot add synapse: nodes #{} and #{} not in same cluster", from, to);
+    }
+
+    fn execute_command(&mut self, cmd: &str) {
+        let parts: Vec<&str> = cmd.trim().split_whitespace().collect();
+        if parts.is_empty() {
+            return;
+        }
+        match parts[0] {
+            "search" | "s" => {
+                if parts.len() > 1 {
+                    let query = parts[1..].join(" ");
+                    self.search_query = query.clone();
+                    self.search_node(&query);
+                    println!("🔍 Searching: {}", query);
+                }
+            }
+            "node" | "n" => {
+                if parts.len() > 1 {
+                    let name = parts[1];
+                    let _formula = self.ai_bridge.suggest_formula(name);
+                    let pos = [
+                        rand::thread_rng().gen_range(-20.0..20.0),
+                        rand::thread_rng().gen_range(-20.0..20.0),
+                        rand::thread_rng().gen_range(-20.0..20.0),
+                    ];
+                    self.add_node(name, pos);
+                    println!("✦ Node '{}' created via command", name);
+                }
+            }
+            "help" | "h" | "?" => {
+                println!("Commands: search <name>, node <name>, help");
+            }
+            _ => {
+                println!("Unknown command: {}", cmd);
+            }
+        }
+    }
+}
+
+// ============================================================
+// AI Formula Bridge
+// ============================================================
+
+struct AiBridge {
+    callback: Option<Box<dyn Fn(&str) -> String>>,
+}
+
+impl AiBridge {
+    fn new() -> Self {
+        Self { callback: None }
+    }
+
+    fn suggest_formula(&self, prompt: &str) -> String {
+        if let Some(cb) = &self.callback {
+            cb(prompt)
+        } else {
+            format!("f(x) = {}", prompt)
+        }
+    }
+}
+
+impl std::fmt::Debug for AiBridge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AiBridge")
+            .field("callback", if self.callback.is_some() { &"Some(..)" } else { &"None" })
+            .finish()
+    }
 }
 
 // ============================================================
@@ -236,8 +390,8 @@ struct SynapseVertex {
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct CameraUniform {
-    view: [[f32; 4]; 4],
-    proj: [[f32; 4]; 4],
+    view: Mat4,
+    proj: Mat4,
 }
 
 // ============================================================
@@ -248,64 +402,24 @@ struct Camera {
     pitch: f32,
     yaw: f32,
     distance: f32,
-    target: [f32; 3],
+    target: Vec3,
 }
 
 impl Camera {
     fn new() -> Self {
-        Self { pitch: -0.3, yaw: 0.0, distance: 120.0, target: [0.0, 0.0, 0.0] }
+        Self { pitch: -0.3, yaw: 0.0, distance: 120.0, target: Vec3::ZERO }
     }
 
-    fn view_matrix(&self) -> [[f32; 4]; 4] {
+    fn view_matrix(&self) -> Mat4 {
         let (sp, cp) = self.pitch.sin_cos();
         let (sy, cy) = self.yaw.sin_cos();
-        let eye = [
-            self.target[0] + self.distance * cy * cp,
-            self.target[1] + self.distance * sp,
-            self.target[2] + self.distance * sy * cp,
-        ];
-        look_at_rh(eye, self.target, [0.0, 1.0, 0.0])
+        let eye = Vec3::new(
+            self.target.x + self.distance * cy * cp,
+            self.target.y + self.distance * sp,
+            self.target.z + self.distance * sy * cp,
+        );
+        Mat4::look_at_rh(eye, self.target, Vec3::Y)
     }
-}
-
-fn look_at_rh(eye: [f32; 3], target: [f32; 3], up: [f32; 3]) -> [[f32; 4]; 4] {
-    let f = normalize(sub(eye, target));
-    let r = normalize(cross(up, f));
-    let u = cross(f, r);
-    [
-        [r[0], u[0], f[0], 0.0],
-        [r[1], u[1], f[1], 0.0],
-        [r[2], u[2], f[2], 0.0],
-        [-dot(r, eye), -dot(u, eye), -dot(f, eye), 1.0],
-    ]
-}
-
-fn perspective(fov_y: f32, aspect: f32, near: f32, far: f32) -> [[f32; 4]; 4] {
-    let f = 1.0 / (fov_y * 0.5).tan();
-    [
-        [f / aspect, 0.0, 0.0, 0.0],
-        [0.0, f, 0.0, 0.0],
-        [0.0, 0.0, (far + near) / (near - far), -1.0],
-        [0.0, 0.0, 2.0 * far * near / (near - far), 0.0],
-    ]
-}
-
-fn sub(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
-    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
-}
-
-fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
-    [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
-}
-
-fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
-    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
-}
-
-fn normalize(v: [f32; 3]) -> [f32; 3] {
-    let len = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
-    if len == 0.0 { return v; }
-    [v[0] / len, v[1] / len, v[2] / len]
 }
 
 // ============================================================
@@ -422,7 +536,10 @@ impl State {
 
         // Camera uniform
         let camera = Camera::new();
-        let camera_uniform = CameraUniform { view: camera.view_matrix(), proj: perspective(45.0_f32.to_radians(), size.width as f32 / size.height as f32, 0.1, 500.0) };
+        let camera_uniform = CameraUniform {
+            view: camera.view_matrix(),
+            proj: Mat4::perspective_rh_gl(45.0_f32.to_radians(), size.width as f32 / size.height as f32, 0.1, 500.0),
+        };
         let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Camera"),
             contents: bytemuck::cast_slice(&[camera_uniform]),
@@ -613,7 +730,7 @@ impl State {
         self.queue.write_buffer(&self.synapse_buffer, 0, bytemuck::cast_slice(&vertices));
 
         // Camera
-        let proj = perspective(45.0_f32.to_radians(), self.window_size.0 as f32 / self.window_size.1 as f32, 0.1, 500.0);
+        let proj = Mat4::perspective_rh_gl(45.0_f32.to_radians(), self.window_size.0 as f32 / self.window_size.1 as f32, 0.1, 500.0);
         let cu = CameraUniform { view: self.camera.view_matrix(), proj };
         self.queue.write_buffer(&self.camera_buffer, 0, bytemuck::cast_slice(&[cu]));
     }
@@ -646,7 +763,7 @@ fn build_ui(egui_ctx: &egui::Context, app: &mut App) {
             ui.separator();
             ui.label(format!("Tick: {}", app.tick));
             ui.checkbox(&mut app.auto_tick, "Auto Tick");
-            if ui.button("Manual Tick").clicked() { app.advance(); }
+            if ui.button("Manual Tick").clicked() { app.advance(0.5); }
             ui.separator();
 
             for (i, c) in app.cache.clusters.iter().enumerate() {
@@ -673,7 +790,8 @@ fn build_ui(egui_ctx: &egui::Context, app: &mut App) {
             ui.label(egui::RichText::new(format!("Purple: {}", cnt[2])).color(status_egui_color(NodeStatus::Purple)));
             ui.separator();
             ui.label("L-Drag→Rotate  R-Drag→Pan  Scroll→Zoom");
-            ui.label("S → Search  Space→Auto  R→Reset Cam");
+            ui.label("S→Search  : →Command  Space→Auto  R→Reset");
+            ui.label("N→New Node  M→New Synapse  Click→Select");
         });
 
     // ── Panel 2: Formula Editor ──
@@ -750,23 +868,16 @@ fn build_ui(egui_ctx: &egui::Context, app: &mut App) {
 
 fn pick_node(app: &App, camera: &Camera, mouse: (f64, f64), size: (u32, u32)) -> Option<usize> {
     let aspect = size.0 as f32 / size.1 as f32;
-    let proj = perspective(45.0_f32.to_radians(), aspect, 0.1, 500.0);
+    let proj = Mat4::perspective_rh_gl(45.0_f32.to_radians(), aspect, 0.1, 500.0);
     let view = camera.view_matrix();
 
     // Transform point to clip space, then screen space
-    fn project(pos: [f32; 3], proj: [[f32; 4]; 4], view: [[f32; 4]; 4], w: f32, h: f32) -> (f32, f32) {
-        // clip_pos = proj * view * world_pos
-        let vx = view[0][0]*pos[0] + view[0][1]*pos[1] + view[0][2]*pos[2] + view[0][3];
-        let vy = view[1][0]*pos[0] + view[1][1]*pos[1] + view[1][2]*pos[2] + view[1][3];
-        let vz = view[2][0]*pos[0] + view[2][1]*pos[1] + view[2][2]*pos[2] + view[2][3];
-        let vw = view[3][0]*pos[0] + view[3][1]*pos[1] + view[3][2]*pos[2] + view[3][3];
-        let cx = proj[0][0]*vx + proj[0][1]*vy + proj[0][2]*vz + proj[0][3]*vw;
-        let cy = proj[1][0]*vx + proj[1][1]*vy + proj[1][2]*vz + proj[1][3]*vw;
-        let _cz = proj[2][0]*vx + proj[2][1]*vy + proj[2][2]*vz + proj[2][3]*vw;
-        let cw = proj[3][0]*vx + proj[3][1]*vy + proj[3][2]*vz + proj[3][3]*vw;
-        if cw == 0.0 { return (0.0, 0.0); }
-        let ndc_x = cx / cw;
-        let ndc_y = cy / cw;
+    fn project(pos: [f32; 3], proj: Mat4, view: Mat4, w: f32, h: f32) -> (f32, f32) {
+        let p = Vec4::new(pos[0], pos[1], pos[2], 1.0);
+        let clip = proj * view * p;
+        if clip.w == 0.0 { return (0.0, 0.0); }
+        let ndc_x = clip.x / clip.w;
+        let ndc_y = clip.y / clip.w;
         let sx = (ndc_x + 1.0) * 0.5 * w;
         let sy = (1.0 - ndc_y) * 0.5 * h;
         (sx, sy)
@@ -818,7 +929,7 @@ fn main() {
                         if app.auto_tick {
                             let now = Instant::now();
                             if now.duration_since(last_tick) >= tick_interval {
-                                app.advance();
+                                app.advance(0.5);
                                 last_tick = now;
                             }
                         }
@@ -942,9 +1053,9 @@ fn main() {
                                 let f = state.camera.distance * 0.002;
                                 let (sy, cy) = state.camera.yaw.sin_cos();
                                 let (sp, cp) = state.camera.pitch.sin_cos();
-                                state.camera.target[0] -= (dx as f32 * cy * cp + dy as f32 * sy) * f;
-                                state.camera.target[1] += dy as f32 * sp * f;
-                                state.camera.target[2] -= (dx as f32 * sy * cp - dy as f32 * cy) * f;
+                                state.camera.target.x -= (dx as f32 * cy * cp + dy as f32 * sy) * f;
+                                state.camera.target.y += dy as f32 * sp * f;
+                                state.camera.target.z -= (dx as f32 * sy * cp - dy as f32 * cy) * f;
                             }
                             state.orbit.prev_x = position.x;
                             state.orbit.prev_y = position.y;
@@ -984,15 +1095,57 @@ fn main() {
                             if let PhysicalKey::Code(code) = ke.physical_key {
                                 match code {
                                     KeyCode::Space => { app.auto_tick = !app.auto_tick; }
+                                    KeyCode::Backspace => { app.command_buffer.pop(); }
                                     KeyCode::KeyR => state.camera = Camera::new(),
                                     KeyCode::KeyS => { state.text_input.push('s'); }
-                                    KeyCode::Enter => { let q = app.search_query.clone(); app.search_node(&q); }
+                                    KeyCode::Enter => {
+                                        if !app.command_buffer.is_empty() {
+                                            let cmd = app.command_buffer.clone();
+                                            app.execute_command(&cmd);
+                                            app.command_buffer.clear();
+                                        } else {
+                                            let q = app.search_query.clone();
+                                            app.search_node(&q);
+                                        }
+                                    }
+                                    KeyCode::KeyN => {
+                                        let mut rng = rand::thread_rng();
+                                        let pos = [
+                                            state.camera.target.x + rng.gen_range(-10.0..10.0),
+                                            state.camera.target.y + rng.gen_range(-10.0..10.0),
+                                            state.camera.target.z + rng.gen_range(-10.0..10.0),
+                                        ];
+                                        app.add_node("NeuronNew", pos);
+                                    }
+                                    KeyCode::KeyM => {
+                                        if let Some(sid) = app.selected_id {
+                                            let others: Vec<usize> = app.cache.clusters.iter()
+                                                .flat_map(|c| c.nodes.iter().map(|n| n.id))
+                                                .filter(|&id| id != sid)
+                                                .collect();
+                                            if !others.is_empty() {
+                                                let idx = rand::thread_rng().gen_range(0..others.len());
+                                                app.add_synapse(sid, others[idx]);
+                                            }
+                                        }
+                                    }
                                     _ => {}
                                 }
                             }
                             if let Some(ref text) = ke.text {
                                 if !text.is_empty() {
-                                    state.text_input.push_str(text);
+                                    // ':' prefix routes to command buffer, otherwise search
+                                    if text == ":" {
+                                        // activate command mode - clear search, route to command
+                                        app.command_buffer.clear();
+                                        app.search_query.clear();
+                                        app.search_node("");
+                                    } else if !app.command_buffer.is_empty() || text.starts_with(':') {
+                                        let clean = text.trim_start_matches(':');
+                                        app.command_buffer.push_str(clean);
+                                    } else {
+                                        state.text_input.push_str(text);
+                                    }
                                 }
                             }
                         }
