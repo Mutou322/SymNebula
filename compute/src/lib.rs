@@ -1,15 +1,9 @@
-// ============================================================
-// SymNebula Adaptive Scheduler
-//
-// CPU/GPU 自适应调度
-// 统一 SolverBackend trait，根据集群大小动态选择后端
-// ============================================================
-
 pub mod types;
 pub mod trait_;
 pub mod cpu;
 pub mod gpu;
 pub mod scheduler;
+pub mod tick;
 
 pub use types::*;
 pub use trait_::SolverBackend;

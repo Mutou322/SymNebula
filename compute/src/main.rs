@@ -1,41 +1,39 @@
-use sym_nebula_compute::{
-    types::{Cluster, RuntimeSnapshot},
-    AdaptiveScheduler,
-};
+use sym_nebula_compute::types::{Cluster, NodeStatus, RuntimeSnapshot};
+use sym_nebula_compute::tick::tick_step;
+use sym_nebula_compute::AdaptiveScheduler;
 
 fn main() {
     println!("{}", "=".repeat(55));
-    println!("  SymNebula Adaptive Scheduler Demo");
+    println!("  SymNebula — Adaptive Tick Simulation");
     println!("{}", "=".repeat(55));
 
-    let clusters = vec![
-        Cluster { id: 1, num_nodes: 10_000 },
-        Cluster { id: 2, num_nodes: 500_000 },
-        Cluster { id: 3, num_nodes: 5_000 },
+    let mut clusters = vec![
+        Cluster {
+            id: 1,
+            num_nodes: 10_000,
+            x_cluster: vec![0.0; 5],
+            status: NodeStatus::Yellow,
+        },
+        Cluster {
+            id: 2,
+            num_nodes: 500_000,
+            x_cluster: vec![1.0; 5],
+            status: NodeStatus::Yellow,
+        },
+        Cluster {
+            id: 3,
+            num_nodes: 5_000,
+            x_cluster: vec![2.0; 5],
+            status: NodeStatus::Yellow,
+        },
     ];
 
-    // 假设 GPU 可用
     let mut scheduler = AdaptiveScheduler::new(true);
 
-    let snapshot = RuntimeSnapshot { tick: 0 };
-
     println!();
-    println!("  GPU_THRESHOLD = 50,000 nodes");
-    println!();
-
-    for cluster in &clusters {
-        let result = scheduler.solve_cluster(cluster, &snapshot);
-        println!(
-            "  Cluster {} ({:>6} nodes) → {:>6?}  [{}]",
-            cluster.id,
-            cluster.num_nodes,
-            scheduler.mode,
-            if result == sym_nebula_compute::SolverResult::Success {
-                "OK"
-            } else {
-                "FAIL"
-            }
-        );
+    for t in 0..5 {
+        let snapshot = RuntimeSnapshot { tick: t };
+        tick_step(&mut clusters, &snapshot, &mut scheduler);
     }
 
     println!();

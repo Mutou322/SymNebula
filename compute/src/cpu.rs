@@ -1,15 +1,15 @@
-use crate::types::{Cluster, RuntimeSnapshot, SolverResult};
+use crate::types::{Cluster, RuntimeSnapshot};
 use crate::SolverBackend;
 
-/// CPU 后端：委托给 sym-nebula-core 的 Newton 求解器
+/// CPU 后端：模拟 Newton 迭代，步长 0.1
 pub struct CpuBackend;
 
 impl SolverBackend for CpuBackend {
-    fn solve(&mut self, cluster: &Cluster, _snapshot: &RuntimeSnapshot) -> SolverResult {
+    fn solve(&mut self, cluster: &mut Cluster, _snapshot: &RuntimeSnapshot) -> bool {
         println!("[CPU] Solving Cluster {} with {} nodes", cluster.id, cluster.num_nodes);
-        // TODO: 调用 core 的 NewtonSolver / BlockNewton
-        // let mut solver = sym_nebula_core::solver::create_solver(...);
-        // solver.solve(...);
-        SolverResult::Success
+        for x in cluster.x_cluster.iter_mut() {
+            *x += 0.1;
+        }
+        true
     }
 }
