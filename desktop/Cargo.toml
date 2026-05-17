@@ -6,6 +6,7 @@ description = "SymNebula Desktop Runtime — Bevy GPU visualization"
 
 [dependencies]
 sym-nebula-core = { path = "../core" }
+sym-nebula-compute = { path = "../compute" }
 bevy = { version = "0.14", default-features = false, features = [
     "bevy_asset", "bevy_core_pipeline",
     "bevy_gizmos", "bevy_pbr", "bevy_render", "bevy_scene",

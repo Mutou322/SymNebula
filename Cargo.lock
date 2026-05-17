@@ -3507,6 +3507,7 @@ dependencies = [
  "bevy",
  "bevy_egui",
  "rand",
+ "sym-nebula-compute",
  "sym-nebula-core",
 ]
 
