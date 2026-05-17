@@ -1,45 +1,50 @@
-// SymNebula Interactive Desktop Runtime — 全功能交互版（封闭闭环）
+// SymNebula Desktop — Pure wgpu + winit + egui
 //
-// - Node.inputs 上游连接列表（由突触自动填充）
-// - gather_inputs 突触权重传播收集
-// - node_formula_eval 公式 → 聚合函数（avg/sum/max/min/x+N/rand）
-// - compute_cluster_tick 封闭 Tick：收集 → 求值 → 判定 → Rollback Commit
-// - 突触可视化（颜色渐变 + 权重亮暗）
-// - 全节点公式编辑面板
-// - 波形动画 + 状态彩条 + 收敛追踪
+// 架构: App (Tick/集群) → sync_buffers → wgpu RenderPass (点+线+egui)
+//
+// 操作:
+//   左键拖拽  → 旋转视角      S  → 搜索节点
+//   右键拖拽  → 平移视角      R  → 重置相机
+//   滚轮      → 缩放         空格 → 切换自动 Tick
+//   左键单击  → 选中节点      Enter → 执行搜索
 
-use bevy::input::mouse::MouseMotion;
-use bevy::prelude::*;
-use bevy::time::TimerMode;
-use bevy_egui::{egui, EguiContexts, EguiPlugin};
+use std::time::Instant;
+use wgpu::util::DeviceExt;
+use winit::{
+    event::*,
+    event_loop::EventLoop,
+    keyboard::{KeyCode, PhysicalKey},
+    window::Window,
+};
+
 use rand::Rng;
-use sym_nebula_compute::types::{NodeStatus, GPU_THRESHOLD};
+use sym_nebula_compute::types::NodeStatus;
+
+mod cluster; // compute_cluster_tick, gather_inputs, node_formula_eval
 
 // ============================================================
 // 数据结构
 // ============================================================
 
-/// 单节点
 #[derive(Debug, Clone)]
 struct Node {
     id: usize,
-    position: Vec3,
+    name: String,
+    position: [f32; 3],
     status: NodeStatus,
     x_value: f64,
     formula: String,
-    /// 上游节点 ID 列表（通过突触连接）
     inputs: Vec<usize>,
+    highlighted: bool,
 }
 
-/// 突触
 #[derive(Debug, Clone)]
 struct Synapse {
-    from: usize, // Node ID
-    to: usize,   // Node ID
+    from: usize,
+    to: usize,
     weight: f64,
 }
 
-/// 集群状态
 #[derive(Debug)]
 struct ClusterState {
     id: usize,
@@ -50,245 +55,38 @@ struct ClusterState {
     status: NodeStatus,
 }
 
-/// 集群缓存
 #[derive(Debug)]
 struct ClusterCache {
     topology_version: u64,
     clusters: Vec<ClusterState>,
 }
 
-/// 运行时 Resource
-#[derive(Resource)]
-struct Runtime {
-    tick: usize,
-    gpu_available: bool,
+#[derive(Debug)]
+struct App {
+    tick: u64,
     cache: ClusterCache,
     converged: Vec<bool>,
     just_committed: Vec<bool>,
-    tick_timer: Timer,
     auto_tick: bool,
+    search_query: String,
+    selected_id: Option<usize>,
 }
 
-impl Runtime {
-    fn find_node(&self, node_id: usize) -> Option<&Node> {
-        for c in &self.cache.clusters {
-            if let Some(n) = c.nodes.iter().find(|n| n.id == node_id) {
-                return Some(n);
-            }
-        }
-        None
-    }
-
-    fn find_node_mut(&mut self, node_id: usize) -> Option<&mut Node> {
-        for c in &mut self.cache.clusters {
-            if let Some(n) = c.nodes.iter_mut().find(|n| n.id == node_id) {
-                return Some(n);
-            }
-        }
-        None
-    }
-
-    fn find_cluster(&self, cluster_id: usize) -> Option<&ClusterState> {
-        self.cache.clusters.iter().find(|c| c.id == cluster_id)
-    }
-
-    fn find_cluster_mut(&mut self, cluster_id: usize) -> Option<&mut ClusterState> {
-        self.cache.clusters.iter_mut().find(|c| c.id == cluster_id)
-    }
-
-    /// 执行一次封闭 Tick：收集输入 → 公式求值 → 判定 → Rollback-safe Commit
-    fn advance(&mut self) {
-        self.tick += 1;
-        for (i, cluster) in self.cache.clusters.iter_mut().enumerate() {
-            let was_green = self.converged[i];
-            compute_cluster_tick(cluster);
-            self.just_committed[i] = !was_green && cluster.status == NodeStatus::Green;
-            if self.just_committed[i] {
-                self.converged[i] = true;
-                println!("✦ Cluster {} converged at tick {}", cluster.id, self.tick);
-            }
-            if cluster.status != NodeStatus::Green {
-                self.converged[i] = false;
-            }
-        }
-    }
-}
-
-
-// ============================================================
-// 封闭 Tick 求解器 — 突触传播 + 公式求值 + 状态判定
-// ============================================================
-
-/// 收集节点的上游输入值（upstream.x_value × synapse.weight）
-fn gather_inputs(cluster: &ClusterState, node: &Node) -> Vec<f64> {
-    node.inputs.iter().map(|input_id| {
-        let weight = cluster.synapses.iter()
-            .find(|s| s.from == *input_id && s.to == node.id)
-            .map(|s| s.weight)
-            .unwrap_or(0.0);
-        let from_val = cluster.nodes.iter()
-            .find(|n| n.id == *input_id)
-            .map(|n| n.x_value)
-            .unwrap_or(0.0);
-        from_val * weight
-    }).collect()
-}
-
-/// 公式求值：将节点公式应用于输入值，返回新值
-fn node_formula_eval(node: &Node, inputs: &[f64]) -> f64 {
-    let f = node.formula.trim();
-    if f.is_empty() || f == "rand" {
-        return random_delta() * 5.0;
-    }
-    // 聚合函数
-    if f == "avg" {
-        if inputs.is_empty() { return 0.0; }
-        return inputs.iter().sum::<f64>() / inputs.len() as f64;
-    }
-    if f == "sum" {
-        return inputs.iter().sum();
-    }
-    if f == "max" {
-        if inputs.is_empty() { return 0.0; }
-        return inputs.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-    }
-    if f == "min" {
-        if inputs.is_empty() { return 0.0; }
-        return inputs.iter().cloned().fold(f64::INFINITY, f64::min);
-    }
-    // 传统格式：对第一个输入操作
-    let base = inputs.first().copied().unwrap_or(0.0);
-    if let Some(rhs) = f.strip_prefix("x+") {
-        return base + rhs.trim().parse::<f64>().unwrap_or(0.0);
-    }
-    if let Some(rhs) = f.strip_prefix("x-") {
-        return base - rhs.trim().parse::<f64>().unwrap_or(0.0);
-    }
-    if let Some(rhs) = f.strip_prefix("x=") {
-        return rhs.trim().parse::<f64>().unwrap_or(0.0);
-    }
-    // 纯数字
-    if let Ok(v) = f.parse::<f64>() {
-        return v;
-    }
-    random_delta() * 5.0
-}
-
-/// 对一个集群执行完整封闭 Tick
-fn compute_cluster_tick(cluster: &mut ClusterState) {
-    cluster.temp_x.copy_from_slice(&cluster.x_cluster);
-
-    for (i, node) in cluster.nodes.iter().enumerate() {
-        let input_values = gather_inputs(cluster, node);
-        let new_value = node_formula_eval(node, &input_values);
-        cluster.temp_x[i] = new_value;
-    }
-
-    let sum: f64 = cluster.temp_x.iter().sum();
-    cluster.status = if sum >= 8.0 {
-        NodeStatus::Green
-    } else if sum >= 3.0 {
-        NodeStatus::Yellow
-    } else {
-        NodeStatus::Purple
-    };
-
-    if cluster.status == NodeStatus::Green {
-        cluster.x_cluster.copy_from_slice(&cluster.temp_x);
-        for (i, node) in cluster.nodes.iter_mut().enumerate() {
-            node.x_value = cluster.x_cluster[i];
-        }
-    }
-
-    for node in cluster.nodes.iter_mut() {
-        node.status = cluster.status;
-    }
-}
-
-fn random_delta() -> f64 {
-    rand::random::<f64>() * 0.2 - 0.1
-}
-
-// ============================================================
-// 选中节点
-// ============================================================
-
-#[derive(Resource, Default)]
-struct SelectedNode {
-    node_id: Option<usize>,
-}
-
-// ============================================================
-// ECS 组件
-// ============================================================
-
-#[derive(Component)]
-struct NebulaNode {
-    node_id: usize,
-}
-
-// ============================================================
-// App Entry
-// ============================================================
-
-fn main() {
-    App::new()
-        .insert_resource(Runtime::new())
-        .insert_resource(SelectedNode::default())
-        .add_plugins(
-            DefaultPlugins
-                .set(WindowPlugin {
-                    primary_window: Some(Window {
-                        title: "SymNebula — Interactive Desktop Runtime".into(),
-                        resolution: (1600.0, 900.0).into(),
-                        ..default()
-                    }),
-                    ..default()
-                })
-                .set(AssetPlugin {
-                    watch_for_changes_override: None,
-                    ..default()
-                }),
-        )
-        .add_plugins(EguiPlugin)
-        .add_systems(Startup, setup_scene)
-        .add_systems(
-            Update,
-            (
-                tick_system,
-                node_pick_system,
-                drag_system,
-                update_nodes,
-                draw_synapses,
-                orbit_camera_system,
-                ui_system,
-            )
-                .chain(),
-        )
-        .run();
-}
-
-// ============================================================
-// Runtime 初始化
-// ============================================================
-
-impl Runtime {
+impl App {
     fn new() -> Self {
         let mut rng = rand::thread_rng();
-
-        // 3 个簇配置
         let configs = vec![
             (1usize, 8usize,
              (0..8).map(|i| i as f64 * 0.3).collect::<Vec<f64>>(),
-             Vec3::new(-40.0, 0.0, 0.0),
+             [ -40.0, 0.0, 0.0 ],
              vec!["avg", "avg", "avg", "avg", "x+0.05", "x+0.05", "avg", "avg"]),
             (2, 8,
              vec![0.5f64; 8],
-             Vec3::new(0.0, 0.0, 0.0),
+             [ 0.0, 0.0, 0.0 ],
              vec!["sum", "sum", "sum", "sum", "avg", "avg", "avg", "avg"]),
             (3, 8,
              vec![0.0f64; 8],
-             Vec3::new(40.0, 0.0, 0.0),
+             [ 40.0, 0.0, 0.0 ],
              vec!["rand", "rand", "rand", "x+0.2", "x-0.1", "avg", "avg", "avg"]),
         ];
 
@@ -301,22 +99,22 @@ impl Runtime {
             let ids: Vec<usize> = (0..*count).map(|_| { let id = next_id; next_id += 1; id }).collect();
 
             for (j, &nid) in ids.iter().enumerate() {
-                let pos = Vec3::new(
-                    center.x + rng.gen_range(-spread..spread),
-                    center.y + rng.gen_range(-spread..spread),
-                    center.z + rng.gen_range(-spread..spread),
-                );
                 nodes.push(Node {
                     id: nid,
-                    position: pos,
+                    name: format!("N{}", nid),
+                    position: [
+                        center[0] + rng.gen_range(-spread..spread),
+                        center[1] + rng.gen_range(-spread..spread),
+                        center[2] + rng.gen_range(-spread..spread),
+                    ],
                     status: NodeStatus::Yellow,
                     x_value: x_cluster[j],
                     formula: formulas[j].to_string(),
                     inputs: Vec::new(),
+                    highlighted: false,
                 });
             }
 
-            // 簇内突触：环状 + 交叉
             let mut synapses = Vec::new();
             for j in 0..*count {
                 let from = ids[j];
@@ -328,7 +126,6 @@ impl Runtime {
                 }
             }
 
-            // 根据突触填充节点 inputs
             for node in &mut nodes {
                 node.inputs = synapses.iter()
                     .filter(|s| s.to == node.id)
@@ -349,76 +146,177 @@ impl Runtime {
         let n = clusters.len();
         Self {
             tick: 0,
-            gpu_available: true,
             cache: ClusterCache { topology_version: 1, clusters },
             converged: vec![false; n],
             just_committed: vec![false; n],
-            tick_timer: Timer::from_seconds(0.5, TimerMode::Repeating),
             auto_tick: true,
+            search_query: String::new(),
+            selected_id: None,
         }
+    }
+
+    fn advance(&mut self) {
+        self.tick += 1;
+        for (i, cluster) in self.cache.clusters.iter_mut().enumerate() {
+            let was_green = self.converged[i];
+            cluster::compute_cluster_tick(cluster);
+            self.just_committed[i] = !was_green && cluster.status == NodeStatus::Green;
+            if self.just_committed[i] {
+                self.converged[i] = true;
+                println!("✦ Cluster {} converged at tick {}", cluster.id, self.tick);
+            }
+            if cluster.status != NodeStatus::Green {
+                self.converged[i] = false;
+            }
+        }
+    }
+
+    fn search_node(&mut self, query: &str) {
+        let q = query.trim().to_lowercase();
+        for cluster in &mut self.cache.clusters {
+            for node in &mut cluster.nodes {
+                node.highlighted = node.name.to_lowercase().contains(&q)
+                    || node.id.to_string() == q;
+            }
+        }
+    }
+
+    fn find_node(&self, id: usize) -> Option<&Node> {
+        for c in &self.cache.clusters {
+            if let Some(n) = c.nodes.iter().find(|n| n.id == id) {
+                return Some(n);
+            }
+        }
+        None
+    }
+
+    #[allow(dead_code)]
+    fn find_node_mut(&mut self, id: usize) -> Option<&mut Node> {
+        for c in &mut self.cache.clusters {
+            if let Some(n) = c.nodes.iter_mut().find(|n| n.id == id) {
+                return Some(n);
+            }
+        }
+        None
+    }
+
+    fn find_cluster(&self, id: usize) -> Option<&ClusterState> {
+        self.cache.clusters.iter().find(|c| c.id == id)
+    }
+
+    fn find_cluster_mut(&mut self, id: usize) -> Option<&mut ClusterState> {
+        self.cache.clusters.iter_mut().find(|c| c.id == id)
+    }
+
+    fn cluster_id_of(&self, node_id: usize) -> Option<usize> {
+        self.cache.clusters.iter().find(|c| c.nodes.iter().any(|n| n.id == node_id)).map(|c| c.id)
     }
 }
 
 // ============================================================
-// Scene Setup
+// GPU 顶点类型
 // ============================================================
 
-fn setup_scene(
-    mut commands: Commands,
-    runtime: Res<Runtime>,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
-) {
-    commands.spawn(Camera3dBundle {
-        transform: Transform::from_xyz(0.0, 30.0, 130.0)
-            .looking_at(Vec3::ZERO, Vec3::Y),
-        ..default()
-    });
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct NodeVertex {
+    position: [f32; 3],
+    energy: f32,
+    status: u32,
+    highlighted: u32,
+}
 
-    commands.spawn(DirectionalLightBundle {
-        directional_light: DirectionalLight {
-            illuminance: 3000.0,
-            shadows_enabled: false,
-            ..default()
-        },
-        transform: Transform::from_xyz(50.0, 100.0, 50.0)
-            .looking_at(Vec3::ZERO, Vec3::Y),
-        ..default()
-    });
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct SynapseVertex {
+    position: [f32; 3],
+    color: [f32; 3],
+}
 
-    let sphere = meshes.add(Sphere::new(0.4));
-
-    for cluster in &runtime.cache.clusters {
-        for node in &cluster.nodes {
-            let (base, emissive) = status_colors(node.status);
-            commands.spawn((
-                PbrBundle {
-                    mesh: sphere.clone(),
-                    material: materials.add(StandardMaterial {
-                        base_color: base,
-                        emissive: emissive.into(),
-                        ..default()
-                    }),
-                    transform: Transform::from_translation(node.position),
-                    ..default()
-                },
-                NebulaNode {
-                    node_id: node.id,
-                },
-            ));
-        }
-    }
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct CameraUniform {
+    view: [[f32; 4]; 4],
+    proj: [[f32; 4]; 4],
 }
 
 // ============================================================
-// 颜色工具
+// 相机
 // ============================================================
 
-fn status_colors(status: NodeStatus) -> (Color, Color) {
+struct Camera {
+    pitch: f32,
+    yaw: f32,
+    distance: f32,
+    target: [f32; 3],
+}
+
+impl Camera {
+    fn new() -> Self {
+        Self { pitch: -0.3, yaw: 0.0, distance: 120.0, target: [0.0, 0.0, 0.0] }
+    }
+
+    fn view_matrix(&self) -> [[f32; 4]; 4] {
+        let (sp, cp) = self.pitch.sin_cos();
+        let (sy, cy) = self.yaw.sin_cos();
+        let eye = [
+            self.target[0] + self.distance * cy * cp,
+            self.target[1] + self.distance * sp,
+            self.target[2] + self.distance * sy * cp,
+        ];
+        look_at_rh(eye, self.target, [0.0, 1.0, 0.0])
+    }
+}
+
+fn look_at_rh(eye: [f32; 3], target: [f32; 3], up: [f32; 3]) -> [[f32; 4]; 4] {
+    let f = normalize(sub(eye, target));
+    let r = normalize(cross(up, f));
+    let u = cross(f, r);
+    [
+        [r[0], u[0], f[0], 0.0],
+        [r[1], u[1], f[1], 0.0],
+        [r[2], u[2], f[2], 0.0],
+        [-dot(r, eye), -dot(u, eye), -dot(f, eye), 1.0],
+    ]
+}
+
+fn perspective(fov_y: f32, aspect: f32, near: f32, far: f32) -> [[f32; 4]; 4] {
+    let f = 1.0 / (fov_y * 0.5).tan();
+    [
+        [f / aspect, 0.0, 0.0, 0.0],
+        [0.0, f, 0.0, 0.0],
+        [0.0, 0.0, (far + near) / (near - far), -1.0],
+        [0.0, 0.0, 2.0 * far * near / (near - far), 0.0],
+    ]
+}
+
+fn sub(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+}
+
+fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
+}
+
+fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+fn normalize(v: [f32; 3]) -> [f32; 3] {
+    let len = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+    if len == 0.0 { return v; }
+    [v[0] / len, v[1] / len, v[2] / len]
+}
+
+// ============================================================
+// 颜色 & 波形
+// ============================================================
+
+fn status_color(status: NodeStatus) -> [f32; 3] {
     match status {
-        NodeStatus::Green => (Color::srgb(0.1, 1.0, 0.6), Color::srgb(0.0, 0.5, 0.3)),
-        NodeStatus::Yellow => (Color::srgb(1.0, 0.8, 0.1), Color::srgb(0.5, 0.4, 0.0)),
-        NodeStatus::Purple => (Color::srgb(0.8, 0.2, 1.0), Color::srgb(0.4, 0.0, 0.5)),
+        NodeStatus::Green => [0.1, 1.0, 0.6],
+        NodeStatus::Yellow => [1.0, 0.8, 0.1],
+        NodeStatus::Purple => [0.8, 0.2, 1.0],
     }
 }
 
@@ -430,28 +328,6 @@ fn status_egui_color(status: NodeStatus) -> egui::Color32 {
     }
 }
 
-fn wave_offset(x: f64) -> f32 {
-    (x.sin() * 2.0) as f32
-}
-
-fn synapse_blend(s1: NodeStatus, s2: NodeStatus, weight: f64) -> Color {
-    fn comp(s: NodeStatus) -> (f32, f32, f32) {
-        match s {
-            NodeStatus::Green => (0.1, 1.0, 0.6),
-            NodeStatus::Yellow => (1.0, 0.8, 0.1),
-            NodeStatus::Purple => (0.8, 0.2, 1.0),
-        }
-    }
-    let (r1, g1, b1) = comp(s1);
-    let (r2, g2, b2) = comp(s2);
-    let bright = (weight * 0.7 + 0.3) as f32;
-    Color::srgb(
-        (r1 + r2) * 0.5 * bright,
-        (g1 + g2) * 0.5 * bright,
-        (b1 + b2) * 0.5 * bright,
-    )
-}
-
 fn status_bar_char(status: NodeStatus) -> &'static str {
     match status {
         NodeStatus::Green => "G",
@@ -460,291 +336,674 @@ fn status_bar_char(status: NodeStatus) -> &'static str {
     }
 }
 
-// ============================================================
-// Tick 系统
-// ============================================================
+fn wave_offset(x: f64) -> f32 {
+    (x.sin() * 2.0) as f32
+}
 
-fn tick_system(mut runtime: ResMut<Runtime>, time: Res<Time>) {
-    if !runtime.auto_tick {
-        return;
-    }
-    runtime.tick_timer.tick(time.delta());
-    if runtime.tick_timer.just_finished() {
-        runtime.advance();
-    }
+fn synapse_blend(s1: NodeStatus, s2: NodeStatus, weight: f64) -> [f32; 3] {
+    let c1 = status_color(s1);
+    let c2 = status_color(s2);
+    let bright = (weight * 0.7 + 0.3) as f32;
+    [
+        (c1[0] + c2[0]) * 0.5 * bright,
+        (c1[1] + c2[1]) * 0.5 * bright,
+        (c1[2] + c2[2]) * 0.5 * bright,
+    ]
 }
 
 // ============================================================
-// 鼠标拾取
+// wgpu 渲染状态
 // ============================================================
 
-fn node_pick_system(
-    mouse: Res<ButtonInput<MouseButton>>,
-    windows: Query<&Window>,
-    cameras: Query<(&Camera, &GlobalTransform)>,
-    mut selected: ResMut<SelectedNode>,
-    runtime: Res<Runtime>,
-) {
-    if !mouse.just_pressed(MouseButton::Left) {
-        return;
-    }
-    let window = windows.single();
-    let Some(cursor) = window.cursor_position() else { return };
-    let Ok((camera, cam_transform)) = cameras.get_single() else { return };
-    let Some(ray) = camera.viewport_to_world(cam_transform, cursor) else { return };
+struct OrbitCtrl {
+    left_down: bool,
+    right_down: bool,
+    prev_x: f64,
+    prev_y: f64,
+}
 
-    let mut best: Option<(usize, f32)> = None;
-    for c in &runtime.cache.clusters {
-        for node in &c.nodes {
-            let visual = node.position
-                + Vec3::new(0.0, wave_offset(c.x_cluster[node.id % c.x_cluster.len()]), 0.0);
-            let to = visual - ray.origin;
-            let t = to.dot(*ray.direction);
-            if t < 0.0 { continue; }
-            let closest = ray.origin + *ray.direction * t;
-            let dist = closest.distance(visual);
-            if dist < 1.5 && (best.is_none() || t < best.unwrap().1) {
-                best = Some((node.id, t));
-            }
+struct State {
+    surface: wgpu::Surface<'static>,
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    config: wgpu::SurfaceConfiguration,
+    node_pipeline: wgpu::RenderPipeline,
+    synapse_pipeline: wgpu::RenderPipeline,
+    camera_buffer: wgpu::Buffer,
+    camera_bind_group: wgpu::BindGroup,
+    node_buffer: wgpu::Buffer,
+    synapse_buffer: wgpu::Buffer,
+    camera: Camera,
+    orbit: OrbitCtrl,
+    window_size: (u32, u32),
+    // egui
+    egui_ctx: egui::Context,
+    egui_renderer: egui_wgpu::Renderer,
+    // Input state (accumulated between frames)
+    cursor_pos: (f64, f64),
+    left_click: bool,
+    text_input: String,
+    start: Instant,
+}
+
+impl State {
+    async fn new(window: &'static Window) -> Self {
+        let size = window.inner_size();
+        let instance = wgpu::Instance::default();
+        let surface = instance.create_surface(window).unwrap();
+        let adapter = instance.request_adapter(&wgpu::RequestAdapterOptions {
+            compatible_surface: Some(&surface),
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            force_fallback_adapter: false,
+        }).await.unwrap();
+        let (device, queue) = adapter.request_device(
+            &wgpu::DeviceDescriptor { label: None, required_features: wgpu::Features::empty(), required_limits: wgpu::Limits::default() },
+            None,
+        ).await.unwrap();
+        let caps = surface.get_capabilities(&adapter);
+        let format = caps.formats[0];
+        let config = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format,
+            width: size.width,
+            height: size.height,
+            present_mode: wgpu::PresentMode::AutoVsync,
+            alpha_mode: caps.alpha_modes[0],
+            view_formats: vec![],
+            desired_maximum_frame_latency: 2,
+        };
+        surface.configure(&device, &config);
+
+        // Shader
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Nebula Shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
+        });
+
+        // Camera uniform
+        let camera = Camera::new();
+        let camera_uniform = CameraUniform { view: camera.view_matrix(), proj: perspective(45.0_f32.to_radians(), size.width as f32 / size.height as f32, 0.1, 500.0) };
+        let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Camera"),
+            contents: bytemuck::cast_slice(&[camera_uniform]),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let camera_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Camera BGL"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        let camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Camera BG"),
+            layout: &camera_bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: camera_buffer.as_entire_binding(),
+            }],
+        });
+
+        // Node pipeline
+        let node_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Node Pipeline Layout"),
+            bind_group_layouts: &[&camera_bind_group_layout],
+            push_constant_ranges: &[],
+        });
+        let node_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Node Pipeline"),
+            layout: Some(&node_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: "vs_node",
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<NodeVertex>() as wgpu::BufferAddress,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &[
+                        wgpu::VertexAttribute { offset: 0, shader_location: 0, format: wgpu::VertexFormat::Float32x3 },
+                        wgpu::VertexAttribute { offset: 12, shader_location: 1, format: wgpu::VertexFormat::Float32 },
+                        wgpu::VertexAttribute { offset: 16, shader_location: 2, format: wgpu::VertexFormat::Uint32 },
+                        wgpu::VertexAttribute { offset: 20, shader_location: 3, format: wgpu::VertexFormat::Uint32 },
+                    ],
+                }],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: "fs_node",
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::PointList, ..Default::default() },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+        });
+
+        // Synapse pipeline
+        let synapse_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Synapse Pipeline Layout"),
+            bind_group_layouts: &[&camera_bind_group_layout],
+            push_constant_ranges: &[],
+        });
+        let synapse_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Synapse Pipeline"),
+            layout: Some(&synapse_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: "vs_synapse",
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<SynapseVertex>() as wgpu::BufferAddress,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &[
+                        wgpu::VertexAttribute { offset: 0, shader_location: 0, format: wgpu::VertexFormat::Float32x3 },
+                        wgpu::VertexAttribute { offset: 12, shader_location: 1, format: wgpu::VertexFormat::Float32x3 },
+                    ],
+                }],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: "fs_synapse",
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::LineList, ..Default::default() },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+        });
+
+        // Empty buffers (will be resized in sync)
+        let node_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Node Buffer"),
+            size: 256 * std::mem::size_of::<NodeVertex>() as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let synapse_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Synapse Buffer"),
+            size: 256 * std::mem::size_of::<SynapseVertex>() as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let egui_ctx = egui::Context::default();
+        let egui_renderer = egui_wgpu::Renderer::new(&device, format, None, 1);
+
+        Self {
+            surface, device, queue, config,
+            node_pipeline, synapse_pipeline,
+            camera_buffer, camera_bind_group,
+            node_buffer, synapse_buffer,
+            camera, orbit: OrbitCtrl { left_down: false, right_down: false, prev_x: 0.0, prev_y: 0.0 },
+            window_size: (size.width, size.height),
+            egui_ctx, egui_renderer,
+            cursor_pos: (0.0, 0.0), left_click: false,
+            text_input: String::new(),
+            start: Instant::now(),
         }
     }
-    selected.node_id = best.map(|(id, _)| id);
-}
 
-// ============================================================
-// 节点拖拽
-// ============================================================
-
-fn drag_system(
-    mouse: Res<ButtonInput<MouseButton>>,
-    mut motion_events: EventReader<MouseMotion>,
-    selected: Res<SelectedNode>,
-    mut runtime: ResMut<Runtime>,
-) {
-    if !mouse.pressed(MouseButton::Left) { return; }
-    let Some(nid) = selected.node_id else { return };
-    for ev in motion_events.read() {
-        let d = Vec3::new(ev.delta.x, -ev.delta.y, 0.0) * 0.05;
-        if let Some(node) = runtime.find_node_mut(nid) {
-            node.position += d;
+    fn resize(&mut self, w: u32, h: u32) {
+        if w > 0 && h > 0 {
+            self.window_size = (w, h);
+            self.config.width = w;
+            self.config.height = h;
+            self.surface.configure(&self.device, &self.config);
         }
+    }
+
+    fn sync_buffers(&mut self, app: &App) {
+        // Nodes
+        let nodes: Vec<NodeVertex> = app.cache.clusters.iter().flat_map(|c| {
+            c.nodes.iter().map(|n| NodeVertex {
+                position: [n.position[0], n.position[1] + wave_offset(n.x_value), n.position[2]],
+                energy: (n.x_value.abs() as f32 * 0.1).min(1.0),
+                status: match n.status { NodeStatus::Green => 0, NodeStatus::Yellow => 1, NodeStatus::Purple => 2 },
+                highlighted: if n.highlighted { 1 } else { 0 },
+            })
+        }).collect();
+        let n_nodes = nodes.len() as u64;
+        if n_nodes * std::mem::size_of::<NodeVertex>() as u64 > self.node_buffer.size() {
+            self.node_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Node Buffer"),
+                size: (n_nodes * std::mem::size_of::<NodeVertex>() as u64).next_power_of_two(),
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        }
+        self.queue.write_buffer(&self.node_buffer, 0, bytemuck::cast_slice(&nodes));
+
+        // Synapses
+        let vertices: Vec<SynapseVertex> = app.cache.clusters.iter().flat_map(|c| {
+            c.synapses.iter().filter_map(|s| {
+                let from = c.nodes.iter().find(|n| n.id == s.from)?;
+                let to = c.nodes.iter().find(|n| n.id == s.to)?;
+                let color = synapse_blend(from.status, to.status, s.weight);
+                Some([
+                    SynapseVertex { position: [from.position[0], from.position[1] + wave_offset(from.x_value), from.position[2]], color },
+                    SynapseVertex { position: [to.position[0], to.position[1] + wave_offset(to.x_value), to.position[2]], color },
+                ])
+            }).flatten()
+        }).collect();
+        let n_syn = vertices.len() as u64;
+        if n_syn * std::mem::size_of::<SynapseVertex>() as u64 > self.synapse_buffer.size() {
+            self.synapse_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Synapse Buffer"),
+                size: (n_syn * std::mem::size_of::<SynapseVertex>() as u64).next_power_of_two(),
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        }
+        self.queue.write_buffer(&self.synapse_buffer, 0, bytemuck::cast_slice(&vertices));
+
+        // Camera
+        let proj = perspective(45.0_f32.to_radians(), self.window_size.0 as f32 / self.window_size.1 as f32, 0.1, 500.0);
+        let cu = CameraUniform { view: self.camera.view_matrix(), proj };
+        self.queue.write_buffer(&self.camera_buffer, 0, bytemuck::cast_slice(&[cu]));
     }
 }
 
 // ============================================================
-// 节点更新 — 波形动画 + 状态颜色
+// Egui UI
 // ============================================================
 
-fn update_nodes(
-    runtime: Res<Runtime>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
-    mut query: Query<(&NebulaNode, &mut Transform, &Handle<StandardMaterial>)>,
-) {
-    for (node, mut transform, mat_handle) in &mut query {
-        let Some(rn) = runtime.find_node(node.node_id) else { continue };
-        let wave = wave_offset(rn.x_value);
-        transform.translation = rn.position + Vec3::new(0.0, wave, 0.0);
-        let (base, emissive) = status_colors(rn.status);
-        if let Some(mat) = materials.get_mut(mat_handle) {
-            mat.base_color = base;
-            mat.emissive = emissive.into();
-        }
-    }
+fn get_node_info(app: &App, nid: usize) -> Option<(usize, [f32; 3], NodeStatus, f64, String, Vec<(usize, f64, NodeStatus)>, Vec<(usize, f64, NodeStatus)>)> {
+    let rn = app.find_node(nid)?;
+    let cid = app.cluster_id_of(nid)?;
+    let c = app.find_cluster(cid)?;
+    let inputs = c.synapses.iter()
+        .filter(|s| s.to == nid)
+        .filter_map(|s| app.find_node(s.from).map(|pn| (s.from, s.weight, pn.status)))
+        .collect();
+    let outputs = c.synapses.iter()
+        .filter(|s| s.from == nid)
+        .filter_map(|s| app.find_node(s.to).map(|pn| (s.to, s.weight, pn.status)))
+        .collect();
+    Some((cid, rn.position, rn.status, rn.x_value, rn.formula.clone(), inputs, outputs))
 }
 
-// ============================================================
-// 突触可视化 — 颜色渐变 + 权重亮暗
-// ============================================================
-
-fn draw_synapses(
-    mut gizmos: Gizmos,
-    runtime: Res<Runtime>,
-    selected: Res<SelectedNode>,
-) {
-    for cluster in &runtime.cache.clusters {
-        for synapse in &cluster.synapses {
-            let Some(from) = cluster.nodes.iter().find(|n| n.id == synapse.from) else { continue };
-            let Some(to) = cluster.nodes.iter().find(|n| n.id == synapse.to) else { continue };
-
-            let fw = wave_offset(from.x_value);
-            let tw = wave_offset(to.x_value);
-            let a = from.position + Vec3::new(0.0, fw, 0.0);
-            let b = to.position + Vec3::new(0.0, tw, 0.0);
-
-            let color = synapse_blend(from.status, to.status, synapse.weight);
-
-            let highlight = selected.node_id == Some(synapse.from)
-                || selected.node_id == Some(synapse.to);
-            gizmos.line(a, b, if highlight { Color::srgb(0.9, 0.9, 1.0) } else { color });
-        }
-
-        // 选中节点高亮圈
-        for node in &cluster.nodes {
-            if selected.node_id == Some(node.id) {
-                let w = wave_offset(node.x_value);
-                let pos = node.position + Vec3::new(0.0, w, 0.0);
-                gizmos.circle(pos, Dir3::Y, 0.8, Color::srgb(1.0, 1.0, 1.0));
-            }
-        }
-    }
-}
-
-// ============================================================
-// 轨道相机
-// ============================================================
-
-fn orbit_camera_system(
-    keys: Res<ButtonInput<KeyCode>>,
-    time: Res<Time>,
-    mut query: Query<&mut Transform, With<Camera>>,
-) {
-    let mut transform = query.single_mut();
-    let speed = 80.0 * time.delta_seconds();
-    if keys.pressed(KeyCode::KeyW) { transform.translation.z -= speed; }
-    if keys.pressed(KeyCode::KeyS) { transform.translation.z += speed; }
-    if keys.pressed(KeyCode::KeyA) { transform.translation.x -= speed; }
-    if keys.pressed(KeyCode::KeyD) { transform.translation.x += speed; }
-    if keys.pressed(KeyCode::KeyQ) { transform.translation.y += speed; }
-    if keys.pressed(KeyCode::KeyE) { transform.translation.y -= speed; }
-}
-
-// ============================================================
-// HUD — egui 面板（Runtime + Formula + Inspector）
-// ============================================================
-
-fn ui_system(
-    mut contexts: EguiContexts,
-    mut runtime: ResMut<Runtime>,
-    mut selected: ResMut<SelectedNode>,
-) {
-    // ===================== Panel 1: Runtime Status =====================
+fn build_ui(egui_ctx: &egui::Context, app: &mut App) {
+    // ── Panel 1: Runtime ──
     egui::Window::new("SymNebula Runtime").default_width(360.0)
-        .show(contexts.ctx_mut(), |ui| {
+        .show(egui_ctx, |ui| {
             ui.heading("ClusterSolver");
             ui.separator();
-            ui.label(format!("Tick: {}", runtime.tick));
-            ui.checkbox(&mut runtime.auto_tick, "Auto Tick");
-            if ui.button("Manual Tick").clicked() { runtime.advance(); }
-            ui.label(format!("Cache v{}", runtime.cache.topology_version));
+            ui.label(format!("Tick: {}", app.tick));
+            ui.checkbox(&mut app.auto_tick, "Auto Tick");
+            if ui.button("Manual Tick").clicked() { app.advance(); }
             ui.separator();
 
-            for (i, c) in runtime.cache.clusters.iter().enumerate() {
+            for (i, c) in app.cache.clusters.iter().enumerate() {
                 let ec = status_egui_color(c.status);
-                let mode = if c.nodes.len() > GPU_THRESHOLD && runtime.gpu_available { "GPU" } else { "CPU" };
                 let avg_x = c.nodes.iter().map(|n| n.x_value).sum::<f64>() / c.nodes.len() as f64;
-                let mut line = format!("Cluster {} [{}] {}  {} nodes  x̄={:.2}",
-                    c.id, status_bar_char(c.status), mode, c.nodes.len(), avg_x);
-                if runtime.just_committed[i] { line += " ✦ COMMIT"; }
-                else if runtime.converged[i] { line += " ✓"; }
+                let mut line = format!("Cluster {} [{}]  {} nodes  x̄={:.2}",
+                    c.id, status_bar_char(c.status), c.nodes.len(), avg_x);
+                if app.just_committed[i] { line += " ✦ COMMIT"; }
+                else if app.converged[i] { line += " ✓"; }
                 ui.colored_label(ec, line);
             }
             ui.separator();
 
             let mut cnt = [0u32; 3];
-            for c in &runtime.cache.clusters {
+            for c in &app.cache.clusters {
                 match c.status {
-                    NodeStatus::Green => { cnt[0] += 1; }
-                    NodeStatus::Yellow => { cnt[1] += 1; }
-                    NodeStatus::Purple => { cnt[2] += 1; }
+                    NodeStatus::Green => cnt[0] += 1,
+                    NodeStatus::Yellow => cnt[1] += 1,
+                    NodeStatus::Purple => cnt[2] += 1,
                 }
             }
             ui.label(egui::RichText::new(format!("Green:  {}", cnt[0])).color(status_egui_color(NodeStatus::Green)));
             ui.label(egui::RichText::new(format!("Yellow: {}", cnt[1])).color(status_egui_color(NodeStatus::Yellow)));
             ui.label(egui::RichText::new(format!("Purple: {}", cnt[2])).color(status_egui_color(NodeStatus::Purple)));
             ui.separator();
-            ui.label("W/S/A/D → Move   Q/E → Up/Down");
-            ui.label("Left-click → Select   Drag → Move");
+            ui.label("L-Drag→Rotate  R-Drag→Pan  Scroll→Zoom");
+            ui.label("S → Search  Space→Auto  R→Reset Cam");
         });
 
-    // ===================== Panel 2: Formula Editor =====================
-    // 缓冲所有公式数据，避免借用冲突
-    struct FmtEntry {
-        cid: usize,
-        nid: usize,
-        formula: String,
-        status: NodeStatus,
-        xv: f64,
-    }
-    let entries: Vec<FmtEntry> = runtime.cache.clusters.iter().flat_map(|c| {
+    // ── Panel 2: Formula Editor ──
+    struct FmtEntry { cid: usize, nid: usize, formula: String, status: NodeStatus, xv: f64 }
+    let entries: Vec<FmtEntry> = app.cache.clusters.iter().flat_map(|c| {
         c.nodes.iter().map(|n| FmtEntry {
-            cid: c.id, nid: n.id,
-            formula: n.formula.clone(),
-            status: c.status,
-            xv: n.x_value,
+            cid: c.id, nid: n.id, formula: n.formula.clone(),
+            status: c.status, xv: n.x_value,
         })
     }).collect();
 
     let mut changed = Vec::new();
     egui::Window::new("Formula Editor").default_width(340.0)
-        .show(contexts.ctx_mut(), |ui| {
+        .show(egui_ctx, |ui| {
             egui::ScrollArea::vertical().max_height(400.0).show(ui, |ui| {
-                for e in entries.iter() {
+                for e in &entries {
                     let ec = status_egui_color(e.status);
-                    ui.colored_label(ec, format!("Cluster {} #{}  {:?}  x={:.2}",
-                        e.cid, e.nid, e.status, e.xv));
                     ui.horizontal(|ui| {
                         ui.colored_label(ec, format!("#{}", e.nid));
                         let mut fb = e.formula.clone();
                         ui.add(egui::TextEdit::singleline(&mut fb)
-                            .desired_width(140.0)
-                            .font(egui::TextStyle::Monospace));
+                            .desired_width(140.0).font(egui::TextStyle::Monospace));
                         if fb != e.formula { changed.push((e.cid, e.nid, fb)); }
-                        ui.label(format!("xv={:.3}", e.xv));
+                        ui.label(format!("x={:.3}", e.xv));
                     });
                 }
             });
         });
 
-    // 写回修改的公式
     for (cid, nid, formula) in &changed {
-        if let Some(c) = runtime.find_cluster_mut(*cid) {
+        if let Some(c) = app.find_cluster_mut(*cid) {
             if let Some(n) = c.nodes.iter_mut().find(|n| n.id == *nid) {
                 if n.formula != *formula {
                     n.formula = formula.clone();
-                    runtime.cache.topology_version += 1;
+                    app.cache.topology_version += 1;
                 }
             }
         }
     }
 
-    // ===================== Panel 3: Node Inspector =====================
-    if let Some(nid) = selected.node_id {
-        let Some(rn) = runtime.find_node(nid) else { selected.node_id = None; return; };
-        let cid = cid_from_id(&runtime, nid);
-
-        egui::Window::new("Node Inspector").default_width(320.0)
-            .show(contexts.ctx_mut(), |ui| {
-                ui.heading(format!("Node #{} (Cluster {})", nid, cid));
-                ui.separator();
-                ui.label(format!("Position: ({:.1}, {:.1}, {:.1})", rn.position.x, rn.position.y, rn.position.z));
-                ui.colored_label(status_egui_color(rn.status), format!("Status: {:?}", rn.status));
-                ui.label(format!("x_value: {:.4}", rn.x_value));
-                ui.label(format!("Formula: {}", rn.formula));
-
-                // 突触列表
-                if let Some(c) = runtime.find_cluster(cid) {
+    // ── Panel 3: Node Inspector ──
+    if let Some(nid) = app.selected_id {
+        let info = get_node_info(app, nid);
+        if let Some((cid, pos, status, xv, formula, inputs, outputs)) = info {
+            egui::Window::new(format!("Node #{} (Cluster {})", nid, cid)).default_width(320.0)
+                .show(egui_ctx, |ui| {
                     ui.separator();
-                    ui.label("Synapses:");
-                    for s in &c.synapses {
-                        if s.from == nid || s.to == nid {
-                            let peer = if s.from == nid { s.to } else { s.from };
-                            let arrow = if s.from == nid { "→" } else { "←" };
-                            let name = format!("  {}  #{}  w={:.2}", arrow, peer, s.weight);
-                            if let Some(pn) = runtime.find_node(peer) {
-                                ui.colored_label(status_egui_color(pn.status), format!("{}  {:?}", name, pn.status));
-                            } else {
-                                ui.label(name);
-                            }
+                    ui.label(format!("Pos: ({:.1}, {:.1}, {:.1})", pos[0], pos[1], pos[2]));
+                    ui.colored_label(status_egui_color(status), format!("Status: {:?}", status));
+                    ui.label(format!("x: {:.4}", xv));
+                    ui.label(format!("Formula: {}", formula));
+                    if !inputs.is_empty() {
+                        ui.separator();
+                        ui.label("← Inputs:");
+                        for (id, w, s) in &inputs {
+                            ui.colored_label(status_egui_color(*s), format!("  #{}  w={:.2}  {:?}", id, w, s));
                         }
                     }
-                }
-            });
+                    if !outputs.is_empty() {
+                        ui.separator();
+                        ui.label("→ Outputs:");
+                        for (id, w, s) in &outputs {
+                            ui.colored_label(status_egui_color(*s), format!("  #{}  w={:.2}  {:?}", id, w, s));
+                        }
+                    }
+                });
+        }
     }
 }
 
-fn cid_from_id(runtime: &Runtime, node_id: usize) -> usize {
-    for c in &runtime.cache.clusters {
-        if c.nodes.iter().any(|n| n.id == node_id) { return c.id; }
+// ============================================================
+// 节点拾取
+// ============================================================
+
+fn pick_node(app: &App, camera: &Camera, mouse: (f64, f64), size: (u32, u32)) -> Option<usize> {
+    let aspect = size.0 as f32 / size.1 as f32;
+    let proj = perspective(45.0_f32.to_radians(), aspect, 0.1, 500.0);
+    let view = camera.view_matrix();
+
+    // Transform point to clip space, then screen space
+    fn project(pos: [f32; 3], proj: [[f32; 4]; 4], view: [[f32; 4]; 4], w: f32, h: f32) -> (f32, f32) {
+        // clip_pos = proj * view * world_pos
+        let vx = view[0][0]*pos[0] + view[0][1]*pos[1] + view[0][2]*pos[2] + view[0][3];
+        let vy = view[1][0]*pos[0] + view[1][1]*pos[1] + view[1][2]*pos[2] + view[1][3];
+        let vz = view[2][0]*pos[0] + view[2][1]*pos[1] + view[2][2]*pos[2] + view[2][3];
+        let vw = view[3][0]*pos[0] + view[3][1]*pos[1] + view[3][2]*pos[2] + view[3][3];
+        let cx = proj[0][0]*vx + proj[0][1]*vy + proj[0][2]*vz + proj[0][3]*vw;
+        let cy = proj[1][0]*vx + proj[1][1]*vy + proj[1][2]*vz + proj[1][3]*vw;
+        let _cz = proj[2][0]*vx + proj[2][1]*vy + proj[2][2]*vz + proj[2][3]*vw;
+        let cw = proj[3][0]*vx + proj[3][1]*vy + proj[3][2]*vz + proj[3][3]*vw;
+        if cw == 0.0 { return (0.0, 0.0); }
+        let ndc_x = cx / cw;
+        let ndc_y = cy / cw;
+        let sx = (ndc_x + 1.0) * 0.5 * w;
+        let sy = (1.0 - ndc_y) * 0.5 * h;
+        (sx, sy)
     }
-    0
+
+    let mut best: Option<(usize, f32)> = None;
+    let (mx, my) = mouse;
+    for c in &app.cache.clusters {
+        for n in &c.nodes {
+            let wp = [n.position[0], n.position[1] + wave_offset(n.x_value), n.position[2]];
+            let (sx, sy) = project(wp, proj, view, size.0 as f32, size.1 as f32);
+            let dx = sx - mx as f32;
+            let dy = sy - my as f32;
+            let dist = (dx * dx + dy * dy).sqrt();
+            if dist < 15.0 && best.as_ref().map_or(true, |&(_, bd)| dist < bd) {
+                best = Some((n.id, dist));
+            }
+        }
+    }
+    best.map(|(id, _)| id)
+}
+
+// ============================================================
+// Main
+// ============================================================
+
+fn main() {
+    let event_loop = EventLoop::new().unwrap();
+    let window = Box::leak(Box::new(
+        event_loop.create_window(
+            Window::default_attributes().with_title("SymNebula Desktop — wgpu + egui")
+        ).unwrap()
+    ));
+    let window: &Window = &*window; // shadow to shared ref
+
+    let mut app = App::new();
+    let mut state = pollster::block_on(State::new(window));
+
+    let tick_interval = std::time::Duration::from_millis(500);
+    let mut last_tick = Instant::now();
+
+    event_loop.run(move |event, target| {
+        match event {
+            Event::WindowEvent { event, .. } => {
+                match event {
+                    WindowEvent::CloseRequested => target.exit(),
+                    WindowEvent::RedrawRequested => {
+                        // ── Tick ──
+                        if app.auto_tick {
+                            let now = Instant::now();
+                            if now.duration_since(last_tick) >= tick_interval {
+                                app.advance();
+                                last_tick = now;
+                            }
+                        }
+
+                        // ── Handle accumulated text input for search ──
+                        if !state.text_input.is_empty() {
+                            let q = state.text_input.clone();
+                            app.search_query.clone_from(&q);
+                            app.search_node(&q);
+                            state.text_input.clear();
+                        }
+
+                        // ── Node picking on click ──
+                        if state.left_click {
+                            if !state.egui_ctx.wants_pointer_input() {
+                                app.selected_id = pick_node(&app, &state.camera, state.cursor_pos, state.window_size);
+                                if app.selected_id.is_none() {
+                                    app.search_query.clear();
+                                    for c in &mut app.cache.clusters {
+                                        for n in &mut c.nodes { n.highlighted = false; }
+                                    }
+                                }
+                            }
+                            state.left_click = false;
+                        }
+
+                        // ── Egui frame ──
+                        let elapsed = state.start.elapsed().as_secs_f64();
+                        let raw_input = egui::RawInput {
+                            time: Some(elapsed),
+                            screen_rect: Some(egui::Rect::from_min_max(
+                                egui::pos2(0.0, 0.0),
+                                egui::pos2(state.window_size.0 as f32, state.window_size.1 as f32),
+                            )),
+                            ..Default::default()
+                        };
+                        state.egui_ctx.begin_frame(raw_input);
+                        build_ui(&state.egui_ctx, &mut app);
+                        let output = state.egui_ctx.end_frame();
+                        let clipped_primitives = state.egui_ctx.tessellate(output.shapes, state.egui_ctx.pixels_per_point());
+
+                        // ── Sync GPU buffers ──
+                        state.sync_buffers(&app);
+
+                        // ── Render ──
+                        let output_texture = match state.surface.get_current_texture() {
+                            Ok(t) => t,
+                            Err(wgpu::SurfaceError::Lost) => { state.surface.configure(&state.device, &state.config); return; }
+                            Err(e) => { eprintln!("Surface error: {e:?}"); return; }
+                        };
+                        let view = output_texture.texture.create_view(&wgpu::TextureViewDescriptor::default());
+                        let mut encoder = state.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("Encoder") });
+
+                        // Egui texture updates
+                        for (id, delta) in &output.textures_delta.set {
+                            state.egui_renderer.update_texture(&state.device, &state.queue, *id, &delta);
+                        }
+
+                        // Egui screen descriptor
+                        let screen_descriptor = egui_wgpu::ScreenDescriptor {
+                            size_in_pixels: [state.window_size.0, state.window_size.1],
+                            pixels_per_point: state.egui_ctx.pixels_per_point(),
+                        };
+
+                        // Upload egui buffers
+                        state.egui_renderer.update_buffers(
+                            &state.device, &state.queue, &mut encoder, &clipped_primitives, &screen_descriptor
+                        );
+
+                        {
+                            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                                label: Some("Main Render Pass"),
+                                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                    view: &view,
+                                    resolve_target: None,
+                                    ops: wgpu::Operations {
+                                        load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.0, g: 0.0, b: 0.0, a: 1.0 }),
+                                        store: wgpu::StoreOp::Store,
+                                    },
+                                })],
+                                depth_stencil_attachment: None,
+                                timestamp_writes: None,
+                                occlusion_query_set: None,
+                            });
+
+                            // Draw nodes
+                            pass.set_pipeline(&state.node_pipeline);
+                            pass.set_bind_group(0, &state.camera_bind_group, &[]);
+                            pass.set_vertex_buffer(0, state.node_buffer.slice(..));
+                            let n_nodes: u32 = app.cache.clusters.iter().map(|c| c.nodes.len() as u32).sum();
+                            if n_nodes > 0 {
+                                pass.draw(0..n_nodes, 0..1);
+                            }
+
+                            // Draw synapses
+                            pass.set_pipeline(&state.synapse_pipeline);
+                            pass.set_vertex_buffer(0, state.synapse_buffer.slice(..));
+                            let n_syn_verts: u32 = app.cache.clusters.iter().map(|c| c.synapses.len() as u32 * 2).sum();
+                            if n_syn_verts > 0 {
+                                pass.draw(0..n_syn_verts, 0..1);
+                            }
+
+                            // Egui overlay
+                            state.egui_renderer.render(&mut pass, &clipped_primitives, &screen_descriptor);
+                        }
+
+                        state.queue.submit(std::iter::once(encoder.finish()));
+                        output_texture.present();
+                    }
+                    WindowEvent::Resized(size) => state.resize(size.width, size.height),
+                    WindowEvent::CursorMoved { position, .. } => {
+                        state.cursor_pos = (position.x, position.y);
+                        if state.orbit.left_down || state.orbit.right_down {
+                            let dx = position.x - state.orbit.prev_x;
+                            let dy = position.y - state.orbit.prev_y;
+                            if state.orbit.left_down {
+                                state.camera.yaw += dx as f32 * 0.008;
+                                state.camera.pitch = (state.camera.pitch + dy as f32 * 0.008).clamp(-1.5, 1.5);
+                            }
+                            if state.orbit.right_down {
+                                let f = state.camera.distance * 0.002;
+                                let (sy, cy) = state.camera.yaw.sin_cos();
+                                let (sp, cp) = state.camera.pitch.sin_cos();
+                                state.camera.target[0] -= (dx as f32 * cy * cp + dy as f32 * sy) * f;
+                                state.camera.target[1] += dy as f32 * sp * f;
+                                state.camera.target[2] -= (dx as f32 * sy * cp - dy as f32 * cy) * f;
+                            }
+                            state.orbit.prev_x = position.x;
+                            state.orbit.prev_y = position.y;
+                        }
+                        state.left_click = false; // consume click on drag
+                    }
+                    WindowEvent::MouseInput { state: btn_state, button, .. } => {
+                        match button {
+                            MouseButton::Left => {
+                                state.orbit.left_down = btn_state == ElementState::Pressed;
+                                if btn_state == ElementState::Pressed {
+                                    state.orbit.prev_x = state.cursor_pos.0;
+                                    state.orbit.prev_y = state.cursor_pos.1;
+                                    state.left_click = true;
+                                }
+                            }
+                            MouseButton::Right => {
+                                state.orbit.right_down = btn_state == ElementState::Pressed;
+                                if btn_state == ElementState::Pressed {
+                                    state.orbit.prev_x = state.cursor_pos.0;
+                                    state.orbit.prev_y = state.cursor_pos.1;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    WindowEvent::MouseWheel { delta, .. } => {
+                        let dy = match delta {
+                            MouseScrollDelta::LineDelta(_, y) => y * 2.0,
+                            MouseScrollDelta::PixelDelta(p) => p.y as f32 * 0.1,
+                        };
+                        state.camera.distance = (state.camera.distance * (1.0 - dy * 0.02)).clamp(15.0, 400.0);
+                    }
+                    WindowEvent::KeyboardInput { event: ke, .. } => {
+                        let pressed = ke.state == ElementState::Pressed;
+                        if pressed {
+                            if let PhysicalKey::Code(code) = ke.physical_key {
+                                match code {
+                                    KeyCode::Space => { app.auto_tick = !app.auto_tick; }
+                                    KeyCode::KeyR => state.camera = Camera::new(),
+                                    KeyCode::KeyS => { state.text_input.push('s'); }
+                                    KeyCode::Enter => { let q = app.search_query.clone(); app.search_node(&q); }
+                                    _ => {}
+                                }
+                            }
+                            if let Some(ref text) = ke.text {
+                                if !text.is_empty() {
+                                    state.text_input.push_str(text);
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Event::AboutToWait => {
+                window.request_redraw();
+            }
+            _ => {}
+        }
+    }).unwrap();
 }
