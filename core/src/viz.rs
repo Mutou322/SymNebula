@@ -1,6 +1,8 @@
-/// Tick 状态彩条可视化
+/// Tick 状态彩条可视化 — 完整整合版
 ///
-/// ASCII 表格风格，直接在终端查看每 Tick 的节点状态波形 + 输出值。
+/// ASCII 表格风格，直接在终端查看每 Tick 的节点状态波形：
+/// G=绿 Y=黄 P=紫 -=灰  * 标记首次收敛（转为 Green）的 Tick。
+/// 自动限制最多显示 12 个 Tick 列。
 ///
 /// 用法:
 /// ```ignore
@@ -12,77 +14,174 @@
 /// viz.render();
 /// ```
 
+use crate::ast::Expr;
 use crate::engine::Scheduler;
 use crate::state::NodeState;
 
-/// 单个节点的 Tick 快照
+/// 最多显示的 Tick 列数
+const MAX_COLS: usize = 12;
+
+/// 单个变量的历史状态序列
 #[derive(Debug, Clone)]
-struct NodeSnapshot {
+struct VarHistory {
+    symbol: String,
+    statuses: Vec<NodeState>,
+}
+
+/// 单个节点的历史记录
+#[derive(Debug, Clone)]
+struct NodeHistory {
     id: usize,
     label: String,
-    status: NodeState,
-    outputs: Vec<(String, f64)>,
     is_dynamic: bool,
+    vars: Vec<VarHistory>,
 }
 
-/// 单个 Tick 的记录
-#[derive(Debug, Clone)]
-struct TickRecord {
-    tick: usize,
-    nodes: Vec<NodeSnapshot>,
-}
-
-/// Tick 历史记录器
+/// Tick 状态彩条记录器
 pub struct TickDisplay {
-    records: Vec<TickRecord>,
+    nodes: Vec<NodeHistory>,
+    ticks: Vec<usize>,
     nid_order: Vec<usize>,
+}
+
+/// 移除表达式字符串中冗余的外层括号。
+/// 反复剥除最外层匹配的括号对，直到不再被括号包裹。
+fn strip_outer_parens(s: &str) -> String {
+    let trimmed = s.trim();
+    if !trimmed.starts_with('(') || !trimmed.ends_with(')') {
+        return trimmed.to_string();
+    }
+    let inner = &trimmed[1..trimmed.len() - 1];
+    let mut depth = 0i32;
+    for c in inner.chars() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            _ => {}
+        }
+        if depth < 0 {
+            return trimmed.to_string();
+        }
+    }
+    if depth == 0 {
+        strip_outer_parens(inner)
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// 紧凑格式化表达式，用于节点标签。
+/// - Number: 大/小值用科学计数法，整数用整数格式，中等值截断小数
+/// - 其他: Display 后剥除外层冗余括号
+fn format_expr_compact(expr: &Expr, max_chars: usize) -> String {
+    let s = match expr {
+        Expr::Number(n) => {
+            if *n == 0.0 {
+                "0".to_string()
+            } else if n.abs() >= 1e10 || n.abs() < 1e-4 {
+                let e = format!("{:.4e}", n);
+                // 去掉尾随的 "e0"
+                if e.ends_with("e0") || e.ends_with("e+00") {
+                    e[..e.len() - 2].to_string()
+                } else {
+                    e.replace("e+", "e")
+                }
+            } else if n.fract() == 0.0 && n.is_finite() {
+                format!("{}", *n as i64)
+            } else {
+                let s = format!("{:.6}", n);
+                let trimmed = s
+                    .trim_end_matches('0')
+                    .trim_end_matches('.')
+                    .to_string();
+                if trimmed.is_empty() { "0".to_string() } else { trimmed }
+            }
+        }
+        other => {
+            let raw = format!("{}", other);
+            strip_outer_parens(&raw)
+        }
+    };
+    if s.len() > max_chars {
+        format!("{}…", &s[..max_chars - 1])
+    } else {
+        s
+    }
 }
 
 impl TickDisplay {
     pub fn new() -> Self {
         TickDisplay {
-            records: Vec::new(),
+            nodes: Vec::new(),
+            ticks: Vec::new(),
             nid_order: Vec::new(),
         }
     }
 
-    /// 记录当前 scheduler 状态的快照
+    /// 记录当前 scheduler 的快照
     pub fn record(&mut self, scheduler: &Scheduler) {
         let tick = scheduler.tick;
-        let mut nodes = Vec::new();
+        self.ticks.push(tick);
 
-        for node in &scheduler.graph.nodes {
+        if self.nid_order.is_empty() {
+            self.nid_order = scheduler.graph.nodes.iter().map(|n| n.id).collect();
+        }
+
+        for &nid in &self.nid_order {
+            let node = match scheduler.graph.nodes.iter().find(|n| n.id == nid) {
+                Some(n) => n,
+                None => continue,
+            };
+
+            let nh_idx = match self.nodes.iter().position(|n| n.id == nid) {
+                Some(idx) => idx,
+                None => {
+                    let label = format!("n{}:{}", node.id, format_expr_compact(&node.formula, 20));
+                    self.nodes.push(NodeHistory {
+                        id: nid,
+                        label,
+                        is_dynamic: node.is_dynamic,
+                        vars: Vec::new(),
+                    });
+                    self.nodes.len() - 1
+                }
+            };
+
+            let nh = &mut self.nodes[nh_idx];
+
+            // 从 env 收集该节点的输出符号
             let mut outputs: Vec<(String, f64)> = scheduler
                 .env
                 .iter()
-                .filter(|((nid, _), _)| *nid == node.id)
+                .filter(|((nid2, _), _)| *nid2 == nid)
                 .map(|((_, sym), val)| (sym.clone(), *val))
                 .collect();
             outputs.sort_by(|a, b| a.0.cmp(&b.0));
 
-            // 标签：nid + 简短公式名
-            let formula_raw = format!("{}", node.formula);
-            let formula_short = if formula_raw.len() > 16 {
-                format!("{}…", &formula_raw[..15])
-            } else {
-                formula_raw
-            };
-            let label = format!("n{}:{}", node.id, formula_short);
+            if outputs.is_empty() {
+                let val = scheduler.get_value(nid, "output").unwrap_or(0.0);
+                outputs.push(("output".to_string(), val));
+            }
 
-            nodes.push(NodeSnapshot {
-                id: node.id,
-                label,
-                status: node.state.clone(),
-                outputs,
-                is_dynamic: node.is_dynamic,
-            });
+            let current_state = node.state.clone();
+
+            for (sym, _val) in &outputs {
+                match nh.vars.iter().position(|v| v.symbol == *sym) {
+                    Some(idx) => {
+                        nh.vars[idx].statuses.push(current_state.clone());
+                    }
+                    None => {
+                        let pad_count = self.ticks.len() - 1;
+                        let mut statuses = vec![NodeState::Gray; pad_count];
+                        statuses.push(current_state.clone());
+                        nh.vars.push(VarHistory {
+                            symbol: sym.clone(),
+                            statuses,
+                        });
+                    }
+                }
+            }
         }
-
-        if self.nid_order.is_empty() {
-            self.nid_order = nodes.iter().map(|n| n.id).collect();
-        }
-
-        self.records.push(TickRecord { tick, nodes });
     }
 
     fn status_char(state: &NodeState) -> &'static str {
@@ -94,137 +193,70 @@ impl TickDisplay {
         }
     }
 
-    /// 波形条：用 ░▒▓ 三级灰度表示相对值
-    fn waveform(value: f64, max_val: f64, width: usize) -> String {
-        if !value.is_finite() {
-            return "░".repeat(width);
-        }
-        let ratio = if max_val <= 0.0 {
-            0.0
-        } else {
-            (value.abs() / max_val).clamp(0.0, 1.0)
-        };
-        (0..width)
-            .map(|i| {
-                let pos = i as f64 / width as f64;
-                if pos < ratio {
-                    if pos < ratio * 0.5 {
-                        '░'
-                    } else if pos < ratio * 0.85 {
-                        '▒'
-                    } else {
-                        '▓'
-                    }
-                } else {
-                    '░'
-                }
-            })
-            .collect()
+    /// 首个 Green 在完整状态序列中的下标
+    fn first_green_idx(statuses: &[NodeState]) -> Option<usize> {
+        statuses.iter().position(|s| *s == NodeState::Green)
     }
 
-    /// 全 Tick 中某个输出的最大值
-    fn global_max(&self, node_id: usize, sym: &str) -> f64 {
-        let mut max_val = 0.0_f64;
-        for rec in &self.records {
-            if let Some(ns) = rec.nodes.iter().find(|n| n.id == node_id) {
-                for (s, v) in &ns.outputs {
-                    if s == sym {
-                        max_val = max_val.max(v.abs());
-                    }
-                }
-            }
-        }
-        max_val
-    }
-
-    /// 渲染完整表格
+    /// 渲染完整表格 — G/Y/P 横向彩条 + Commit 标记 *
     pub fn render(&self) {
-        if self.records.is_empty() {
+        if self.ticks.is_empty() {
             println!("  (无记录)");
             return;
         }
 
-        let ticks = self.records.len();
-        let max_cols = 10;
-        let start = if ticks > max_cols { ticks - max_cols } else { 0 };
-        let displayed: Vec<&TickRecord> = self.records[start..].iter().collect();
-        let ncol = displayed.len();
+        let total_ticks = self.ticks.len();
+        let start = if total_ticks > MAX_COLS { total_ticks - MAX_COLS } else { 0 };
+        let displayed_ticks = &self.ticks[start..];
+        let ncol = displayed_ticks.len();
 
-        const LABEL_W: usize = 22;
-        const BAR_W: usize = 8;
+        const LABEL_W: usize = 24;
+        const COL_W: usize = 5;
 
         // 表头
-        let header: String = displayed
+        let header: String = displayed_ticks
             .iter()
-            .map(|r| format!("{:>6}", r.tick))
+            .map(|t| format!("{:>width$}", t, width = COL_W))
             .collect::<Vec<_>>()
             .join(" ");
-        println!("  {:>width$} {}", "Tick", header, width = LABEL_W);
-        println!("  {:->width$} {}", "", "-".repeat(ncol * 7 - 1), width = LABEL_W);
+        println!("  {:>width$}  {}", "Tick →", header, width = LABEL_W);
+        let sep_len = ncol * (COL_W + 1) - 1;
+        println!("  {:->width$}  {}", "", "-".repeat(sep_len), width = LABEL_W);
 
         for &nid in &self.nid_order {
-            let label = self
-                .records
-                .iter()
-                .find_map(|r| r.nodes.iter().find(|n| n.id == nid).map(|n| n.label.clone()))
-                .unwrap_or_else(|| format!("n{}", nid));
+            let nh = match self.nodes.iter().find(|n| n.id == nid) {
+                Some(n) => n,
+                None => continue,
+            };
 
-            let is_dyn = self
-                .records
-                .iter()
-                .find_map(|r| r.nodes.iter().find(|n| n.id == nid).map(|n| n.is_dynamic))
-                .unwrap_or(false);
+            // 节点标签行
+            let dyn_mark = if nh.is_dynamic { " ⚡" } else { "   " };
+            println!("  {:>width$}{}", nh.label, dyn_mark, width = LABEL_W - 3);
 
-            let dyn_mark = if is_dyn { " ⚡" } else { "   " };
-            println!("  {:>width$}{}", label, dyn_mark, width = LABEL_W - 3);
+            // 逐变量状态行
+            for vh in &nh.vars {
+                let sliced = &vh.statuses[start..];
+                let full_conv = Self::first_green_idx(&vh.statuses);
+                let visible_conv = full_conv.and_then(|idx| {
+                    if idx >= start { Some(idx - start) } else { None }
+                });
 
-            // 收集所有输出符号
-            let mut all_syms: Vec<String> = Vec::new();
-            for rec in &displayed {
-                if let Some(ns) = rec.nodes.iter().find(|n| n.id == nid) {
-                    for (s, _) in &ns.outputs {
-                        if !all_syms.contains(s) {
-                            all_syms.push(s.clone());
-                        }
-                    }
-                }
-            }
-            if all_syms.is_empty() {
-                all_syms.push("output".to_string());
-            }
-
-            for sym in &all_syms {
-                let max_val = self.global_max(nid, sym);
-                let wave: String = displayed
+                let line: String = sliced
                     .iter()
-                    .map(|rec| {
-                        if let Some(ns) = rec.nodes.iter().find(|n| n.id == nid) {
-                            if let Some((_, val)) = ns.outputs.iter().find(|(s, _)| s == sym) {
-                                Self::waveform(*val, max_val.max(1e-12), BAR_W)
-                            } else {
-                                "  ---   ".to_string()
-                            }
+                    .enumerate()
+                    .map(|(i, s)| {
+                        let c = Self::status_char(s);
+                        if visible_conv == Some(i) {
+                            format!("{:>width$}", format!("{}*", c), width = COL_W)
                         } else {
-                            "  ---   ".to_string()
+                            format!("{:>width$}", c, width = COL_W)
                         }
                     })
                     .collect::<Vec<_>>()
                     .join(" ");
-                println!("    {:>8}  {}", sym, wave);
+                println!("    {:>width$}  {}", vh.symbol, line, width = LABEL_W - 4);
             }
 
-            let status_line: String = displayed
-                .iter()
-                .map(|rec| {
-                    if let Some(ns) = rec.nodes.iter().find(|n| n.id == nid) {
-                        format!("  {:^3}", Self::status_char(&ns.status))
-                    } else {
-                        " --- ".to_string()
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join(" ");
-            println!("    {:>8}  {}", "Status", status_line);
             println!();
         }
     }
@@ -255,14 +287,9 @@ impl TickDisplay {
                 Some(v) => format!("{: >12.4}", v),
                 None => "        ---".to_string(),
             };
-            let formula_str = format!("{}", node.formula);
-            let label = if formula_str.len() > 22 {
-                format!("{}…", &formula_str[..21])
-            } else {
-                formula_str
-            };
+            let formula_label = format_expr_compact(&node.formula, 22);
             let dyn_mark = if node.is_dynamic { " ⚡" } else { "  " };
-            println!("    n{} [{}{}] {} {}", node.id, c, dyn_mark, label, val_str);
+            println!("    n{} [{}{}] {} {}", node.id, c, dyn_mark, formula_label, val_str);
         }
     }
 }

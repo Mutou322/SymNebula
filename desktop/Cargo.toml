@@ -1,0 +1,16 @@
+[package]
+name = "sym-nebula-desktop"
+version = "0.1.0"
+edition = "2021"
+description = "SymNebula Desktop Runtime — Bevy GPU visualization"
+
+[dependencies]
+sym-nebula-core = { path = "../core" }
+bevy = { version = "0.14", default-features = false, features = [
+    "bevy_asset", "bevy_core_pipeline",
+    "bevy_gizmos", "bevy_pbr", "bevy_render", "bevy_scene",
+    "bevy_sprite", "bevy_text", "bevy_ui", "bevy_winit",
+    "png", "x11",
+] }
+bevy_egui = "0.28"
+rand = "0.8"

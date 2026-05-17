@@ -1,0 +1,8 @@
+[package]
+name = "sym-nebula-compute"
+version = "0.1.0"
+edition = "2021"
+description = "SymNebula Adaptive Scheduler — CPU/GPU solver dispatch"
+
+[dependencies]
+sym-nebula-core = { path = "../core" }

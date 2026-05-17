@@ -1,0 +1,12 @@
+[package]
+name = "sym-nebula-renderer"
+version = "0.1.0"
+edition = "2021"
+description = "SymNebula Pure wgpu GPU Renderer — Million-scale nebula nodes"
+
+[dependencies]
+sym-nebula-core = { path = "../core" }
+wgpu = "0.20"
+winit = "0.30"
+pollster = "0.3"
+bytemuck = { version = "1.15", features = ["derive"] }
