@@ -9,4 +9,5 @@ members = [
     "crates/graph",
     "crates/gpu_batch_solver",
     "crates/gpu_newton_solver",
+    "crates/gpu_newton_solver_advanced",
 ]
