@@ -27,6 +27,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "symmath-graph"
+version = "0.1.0"
+dependencies = [
+ "slotmap",
+ "symmath-ast",
+ "symmath-common",
+ "symmath-ir",
+ "symmath-parser",
+]
+
+[[package]]
 name = "symmath-ir"
 version = "0.1.0"
 dependencies = [

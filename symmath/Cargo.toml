@@ -6,4 +6,5 @@ members = [
     "crates/parser",
     "crates/ir",
     "crates/runtime",
+    "crates/graph",
 ]

@@ -1,0 +1,13 @@
+[package]
+name = "symmath-graph"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+symmath-common = { path = "../common" }
+symmath-ast = { path = "../ast" }
+symmath-ir = { path = "../ir" }
+slotmap = "1.0"
+
+[dev-dependencies]
+symmath-parser = { path = "../parser" }
