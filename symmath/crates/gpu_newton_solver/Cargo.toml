@@ -1,0 +1,19 @@
+[package]
+name = "gpu_newton_solver"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bytemuck = { version = "1", features = ["derive"] }
+
+[features]
+default = []
+gpu = ["dep:wgpu", "dep:pollster"]
+
+[dependencies.wgpu]
+version = "0.20"
+optional = true
+
+[dependencies.pollster]
+version = "0.3"
+optional = true
