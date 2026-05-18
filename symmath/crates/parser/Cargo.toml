@@ -1,0 +1,8 @@
+[package]
+name = "symmath-parser"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+symmath-common = { path = "../common" }
+symmath-ast = { path = "../ast" }
