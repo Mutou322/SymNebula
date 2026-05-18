@@ -55,7 +55,11 @@ impl ConstraintGraph {
                     .map(|iid| self.nodes[*iid].value.unwrap())
                     .collect();
                 let result = if inputs.len() == 1 {
-                    values[0]
+                    match op {
+                        BinaryOp::Sin => values[0].sin(),
+                        BinaryOp::Cos => values[0].cos(),
+                        _ => values[0],
+                    }
                 } else {
                     match op {
                         BinaryOp::Add => values[0] + values[1],
@@ -64,6 +68,7 @@ impl ConstraintGraph {
                         BinaryOp::Div => values[0] / values[1],
                         BinaryOp::Pow => values[0] * values[1],
                         BinaryOp::Eq => values[0] - values[1],
+                        BinaryOp::Sin | BinaryOp::Cos => unreachable!(),
                     }
                 };
                 self.nodes[id].value = Some(result);
@@ -138,9 +143,13 @@ pub fn build_graph(ir: &IRBuilder) -> (ConstraintGraph, HashMap<ValueId, NodeId>
             }
             IRNode::Sin(val) | IRNode::Cos(val) => {
                 let val_id = mapping[val];
+                let op = match ir_node {
+                    IRNode::Sin(_) => BinaryOp::Sin,
+                    _ => BinaryOp::Cos,
+                };
                 let node = Node {
                     kind: NodeKind::Op {
-                        op: BinaryOp::Add,
+                        op,
                         inputs: vec![val_id],
                     },
                     value: None,

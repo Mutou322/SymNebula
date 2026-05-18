@@ -57,6 +57,7 @@ impl Lower {
                     BinaryOp::Div => ir.push(IRNode::Div(l, r)),
                     BinaryOp::Pow => ir.push(IRNode::Mul(l, r)),
                     BinaryOp::Eq => ir.push(IRNode::Eq(l, r)),
+                    BinaryOp::Sin | BinaryOp::Cos => unreachable!(),
                 }
             }
             Expr::Call { func, args } => {

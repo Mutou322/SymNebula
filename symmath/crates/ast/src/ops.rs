@@ -6,6 +6,8 @@ pub enum BinaryOp {
     Div,
     Pow,
     Eq,
+    Sin,
+    Cos,
 }
 
 impl BinaryOp {
@@ -17,6 +19,8 @@ impl BinaryOp {
             BinaryOp::Div => "/",
             BinaryOp::Pow => "^",
             BinaryOp::Eq => "=",
+            BinaryOp::Sin => "sin",
+            BinaryOp::Cos => "cos",
         }
     }
 }
