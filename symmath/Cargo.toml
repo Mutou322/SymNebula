@@ -7,4 +7,5 @@ members = [
     "crates/ir",
     "crates/runtime",
     "crates/graph",
+    "crates/gpu_batch_solver",
 ]
