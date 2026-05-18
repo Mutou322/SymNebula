@@ -1,0 +1,10 @@
+[package]
+name = "distributed_cluster_solver_hpc"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+wgpu = "0.20"
+pollster = "0.3"
+bytemuck = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
